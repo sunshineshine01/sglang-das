@@ -13,7 +13,9 @@ callers send them through the scheduler client so warmup exercises the same
 request transport path as real generation.
 """
 
+import json
 from copy import copy
+from dataclasses import fields
 from typing import Any
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
@@ -57,6 +59,35 @@ def get_model_sampling_defaults(server_args: ServerArgs) -> SamplingParams:
         backend=server_args.backend,
         model_id=server_args.model_id,
     )
+
+
+def _apply_warmup_sampling_overrides(
+    server_args: ServerArgs, defaults: SamplingParams
+) -> SamplingParams:
+    value = server_args.warmup_sampling_params
+    if value is None:
+        return defaults
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                "--warmup-sampling-params must be a JSON object"
+            ) from error
+    if not isinstance(value, dict):
+        raise ValueError("--warmup-sampling-params must be a JSON object")
+    field_names = {item.name for item in fields(defaults)}
+    unknown = value.keys() - field_names
+    if unknown:
+        raise ValueError(
+            f"invalid --warmup-sampling-params fields: {', '.join(sorted(unknown))}"
+        )
+    updated = copy(defaults)
+    for name, field_value in value.items():
+        # Some model contracts intentionally expose fixed dataclass fields
+        # with init=False; a warmup workload still needs to mirror the request.
+        object.__setattr__(updated, name, field_value)
+    return updated
 
 
 def _resolve_default_warmup_resolution(
@@ -346,6 +377,9 @@ def build_warmup_reqs(
     if not supports_synthetic_warmup(server_args):
         return []
     sampling_defaults = get_model_sampling_defaults(server_args)
+    warmup_prompt = sampling_defaults.prompt
+    if warmup_prompt is None:
+        warmup_prompt = DEFAULT_PLACEHOLDER_PROMPT
 
     if warmup_resolutions is None:
         width, height = _resolve_default_warmup_resolution(
@@ -378,7 +412,7 @@ def build_warmup_reqs(
             data_type=task_type.data_type(),
             width=width,
             height=height,
-            prompt=DEFAULT_PLACEHOLDER_PROMPT,
+            prompt=warmup_prompt,
         )
         req_kwargs["sampling_params"] = copy(sampling_defaults)
         req_kwargs.update(
@@ -394,8 +428,13 @@ def build_warmup_reqs(
                 raise RuntimeError(
                     "Warmup image path is required for image-input model"
                 )
-            req_kwargs["prompt"] = DEFAULT_PLACEHOLDER_PROMPT
-            req_kwargs["image_path"] = [warmup_input_path]
+            default_image_path = sampling_defaults.image_path
+            image_count = (
+                len(default_image_path)
+                if isinstance(default_image_path, (list, tuple))
+                else 1
+            )
+            req_kwargs["image_path"] = [warmup_input_path] * max(1, image_count)
         if server_args.enable_cfg_parallel:
             if not req_kwargs.get("negative_prompt"):
                 req_kwargs["negative_prompt"] = DEFAULT_PLACEHOLDER_PROMPT
@@ -405,9 +444,9 @@ def build_warmup_reqs(
 
         run_real_path_prewarm = server_based_warmup and server_args.enable_torch_compile
         prompts = (
-            (DEFAULT_PLACEHOLDER_PROMPT,) + TORCH_COMPILE_REAL_PATH_PREWARM_PROMPTS
+            (warmup_prompt,) + TORCH_COMPILE_REAL_PATH_PREWARM_PROMPTS
             if run_real_path_prewarm
-            else (DEFAULT_PLACEHOLDER_PROMPT,)
+            else (warmup_prompt,)
         )
         for prompt_idx, prompt in enumerate(prompts):
             prompt_req_kwargs = req_kwargs.copy()

@@ -20,6 +20,7 @@ from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from sglang.multimodal_gen.configs.post_training import RLRolloutArgs
+from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import StoreBoolean, expand_path_fields
 
@@ -54,10 +55,89 @@ def generate_request_id() -> str:
     return str(uuid.uuid4())
 
 
-# Validated request-level quality levels. "lossless" is the exact reference
-# path (bit-exact against the CI golden outputs); "high" opts into validated
-# accelerated paths whose quality is guaranteed but not bit-exact.
-QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
+# Validated request-level quality levels.
+# - "exact": the reference path, plus the fast paths that reproduce its
+#   rounding exactly. Output is bit-identical to it in the same environment;
+#   ask for this when a run has to be reproducible or when bisecting a
+#   numerical bug.
+# - "lossless" (default): also mount the fast paths that keep the reference
+#   math and the precision of every operand and accumulator, and only move
+#   where the rounding happens. Output matches the reference to rounding
+#   error rather than bit for bit.
+# - "high": opt into validated accelerated paths. Quality stays guaranteed
+#   (the intent is to back every such path with mathematical acceptance
+#   thresholds, e.g. PSNR > 25 against the reference), but the output is no
+#   longer bit-exact versus the HF reference or the CI ground truth.
+QUALITY_LEVELS: tuple[str, ...] = ("exact", "lossless", "high")
+# "extra-high" is the pre-rename name of "lossless"
+QUALITY_ALIASES: dict[str, str] = {"extra-high": "lossless"}
+
+
+def normalize_quality(quality: str) -> str:
+    """Return the canonical quality level for ``quality``, resolving aliases."""
+    level = QUALITY_ALIASES.get(quality, quality)
+    if level not in QUALITY_LEVELS:
+        raise ValueError(
+            f"quality must be one of {[*QUALITY_LEVELS, *QUALITY_ALIASES]}, "
+            f"got {quality!r}"
+        )
+    return level
+
+
+def quality_allows(quality: str, tier: str) -> bool:
+    """Whether a request at ``quality`` may run a fast path of class ``tier``."""
+    return QUALITY_LEVELS.index(quality) >= QUALITY_LEVELS.index(tier)
+
+
+@dataclass(frozen=True)
+class SkipSoftmaxParams:
+    """Validated request-scoped BLASST/Skip-Softmax controls."""
+
+    threshold_scale_factor: float
+    start_step: int = 0
+
+
+def resolve_skip_softmax_params(
+    params: dict[str, Any] | None,
+) -> SkipSoftmaxParams | None:
+    if params is None:
+        return None
+    if not isinstance(params, dict):
+        raise ValueError(f"skip_softmax_params must be a dict, got {params!r}")
+
+    valid_keys = {"threshold_scale_factor", "start_step"}
+    unknown = sorted(set(params) - valid_keys)
+    if unknown:
+        raise ValueError(
+            f"Unknown skip_softmax_params keys: {unknown}. "
+            f"Valid keys: {sorted(valid_keys)}."
+        )
+    if "threshold_scale_factor" not in params:
+        raise ValueError("skip_softmax_params requires 'threshold_scale_factor'.")
+
+    threshold = params["threshold_scale_factor"]
+    if (
+        isinstance(threshold, bool)
+        or not isinstance(threshold, (int, float))
+        or not math.isfinite(float(threshold))
+        or float(threshold) <= 0
+    ):
+        raise ValueError(
+            "skip_softmax_params.threshold_scale_factor must be a finite "
+            f"positive number, got {threshold!r}"
+        )
+
+    start_step = params.get("start_step", 0)
+    if (
+        isinstance(start_step, bool)
+        or not isinstance(start_step, int)
+        or start_step < 0
+    ):
+        raise ValueError(
+            "skip_softmax_params.start_step must be a non-negative int, "
+            f"got {start_step!r}"
+        )
+    return SkipSoftmaxParams(float(threshold), start_step)
 
 
 def _sanitize_filename(name: str, replacement: str = "_", max_length: int = 150) -> str:
@@ -79,22 +159,6 @@ def _sanitize_filename(name: str, replacement: str = "_", max_length: int = 150)
     if max_length and len(ascii_name) > max_length:
         ascii_name = ascii_name[:max_length]
     return ascii_name
-
-
-class DataType(Enum):
-    IMAGE = auto()
-    VIDEO = auto()
-    MESH = auto()
-    ACTION = auto()
-
-    def get_default_extension(self) -> str:
-        if self == DataType.IMAGE:
-            return "png"
-        if self == DataType.VIDEO:
-            return "mp4"
-        if self == DataType.ACTION:
-            return "json"
-        return "glb"
 
 
 @dataclass
@@ -132,20 +196,21 @@ class SamplingParams:
     )
     output_quality: str | None = "default"
     output_compression: int | None = None
-    # Model-owned, request-scoped quality level.
+    # Model-owned, request-scoped quality level (see QUALITY_LEVELS).
     #
-    # - "lossless" (default): the exact reference path. Output is expected to
-    #   be bit-identical to the HF reference implementation and to pass the
-    #   CI golden/ground-truth comparisons.
-    # - "high": opt into validated accelerated paths. Quality stays
-    #   guaranteed (the intent is to back every such path with mathematical
-    #   acceptance thresholds, e.g. PSNR > 25 against the reference), but
-    #   the output is no longer bit-exact versus the HF reference or the CI
-    #   ground truth.
+    # - "exact": the reference path, plus the fast paths that reproduce its
+    #   rounding exactly. Output is bit-identical to it in the same
+    #   environment; ask for this when a run has to be reproducible or when
+    #   bisecting a numerical bug.
+    # - "lossless" (default): also mount the fast paths that keep the
+    #   reference math and the precision of every operand and accumulator,
+    #   and only move where the rounding happens. Output matches the
+    #   reference to rounding error rather than bit for bit.
+    # - "high": also allow model-owned approximate optimizations (lower
+    #   precision, sparse computation, feature caching), which need
+    #   model-specific quality validation.
     #
-    # Models that support "high" must validate the deployment and workload
-    # explicitly. It intentionally participates in the dynamic-batch
-    # signature.
+    # It intentionally participates in the dynamic-batch signature.
     quality: str = "lossless"
 
     # Frame interpolation
@@ -241,6 +306,11 @@ class SamplingParams:
     # request; see DenoisingStage._maybe_override_attention_backend.
     attention_backend_override: str | None = None
 
+    # Request-scoped BLASST/Skip-Softmax sparse attention. This is an explicit
+    # lossy opt-in; compatible self-attention layers are dispatched through
+    # FlashInfer while cross-attention remains on its normal backend.
+    skip_softmax_params: dict[str, Any] | None = None
+
     # Spectrum parameters
     enable_spectrum: bool = False
     spectrum_params: Any = None  # SpectrumParams
@@ -288,6 +358,8 @@ class SamplingParams:
     adjust_frames: bool = True
     # if True, suppress verbose logging for this request
     suppress_logs: bool = field(default=False, metadata={"batch_sig_exclude": True})
+    # requested task type; None resolves from the pipeline config
+    task_type: ModelTaskType | str | None = None
 
     # return output file paths directly to client
     return_file_paths_only: bool = True
@@ -399,6 +471,12 @@ class SamplingParams:
             req.realtime_chunk_size = self.realtime_chunk_size
 
     @classmethod
+    def image_request_extra_fields(cls) -> frozenset[str]:
+        """Declare model-specific multipart image fields accepted by this type."""
+
+        return frozenset()
+
+    @classmethod
     def video_request_extra_fields(cls) -> frozenset[str]:
         """Declare model-specific multipart video fields accepted by this type."""
 
@@ -474,11 +552,9 @@ class SamplingParams:
                 f"prompt_path must be a txt file, got {self.prompt_path!r}"
             )
 
-        if self.quality not in QUALITY_LEVELS:
-            raise ValueError(
-                f"quality must be one of {list(QUALITY_LEVELS)}, "
-                f"got {self.quality!r}"
-            )
+        self.quality = normalize_quality(self.quality)
+
+        resolve_skip_softmax_params(self.skip_softmax_params)
 
         # These are always required to be sane regardless of pipeline.
         if (
@@ -611,13 +687,13 @@ class SamplingParams:
         """
         check if the sampling params is compatible and valid with server_args
         """
-        task_type = pipeline_config.task_type
+        task_type = self.resolve_task_type(pipeline_config)
         if task_type.is_action_gen():
             return
 
         if task_type.requires_image_input():
             # requires image input
-            if self.image_path is None:
+            if not self.image_path:
                 raise ValueError(
                     f"Served model with task type '{task_type.name}' requires an 'image_path' input, but none was provided"
                 )
@@ -628,6 +704,34 @@ class SamplingParams:
                 raise ValueError(
                     f"input_reference is not supported for {task_type.name} models."
                 )
+
+        if task_type.requires_video_input() and not self.video_path:
+            raise ValueError(f"Task {task_type.name} requires a 'video_path' input")
+        # Legacy pipelines retain their model-owned video conditioning checks.
+        # Explicit multi-task declarations use the standard per-task contract.
+        if (
+            self.video_path
+            and (
+                getattr(pipeline_config, "supported_task_types", None) is not None
+                or (
+                    hasattr(pipeline_config, "get_supported_task_types")
+                    and len(pipeline_config.get_supported_task_types()) > 1
+                )
+            )
+            and not task_type.accepts_video_input()
+        ):
+            raise ValueError(f"video_path is not supported for task {task_type.name}")
+
+    def resolve_task_type(self, pipeline_config) -> ModelTaskType:
+        resolver = getattr(pipeline_config, "resolve_task_type", None)
+        if resolver is None:
+            # Compatibility with integrations that supply a lightweight config.
+            return ModelTaskType.parse(self.task_type or pipeline_config.task_type)
+        return resolver(
+            self.task_type,
+            has_image=bool(self.image_path),
+            has_video=bool(self.video_path),
+        )
 
     def _adjust(
         self,
@@ -1112,14 +1216,17 @@ class SamplingParams:
         add_argument(
             "--quality",
             type=str,
-            choices=list(QUALITY_LEVELS),
+            choices=[*QUALITY_LEVELS, *QUALITY_ALIASES],
             help=(
-                "Request-level quality: 'lossless' (default) keeps the exact "
-                "reference path, bit-exact against the reference "
-                "implementation; 'high' opts into the model-owned validated "
-                "accelerated path, whose quality stays guaranteed but is not "
-                "bit-exact. Support and validated deployment constraints are "
-                "model-specific."
+                "Request-level quality: 'lossless' (default) runs every fast "
+                "path that keeps the reference math and operand precision and "
+                "only moves the rounding, so output matches the reference to "
+                "rounding error; 'exact' restricts it to the fast paths that "
+                "reproduce the reference's rounding exactly, giving "
+                "bit-identical output; 'high' also allows model-owned "
+                "approximate optimizations that need model-specific quality "
+                "validation. 'extra-high' is the pre-rename name of "
+                "'lossless'."
             ),
         )
         add_argument(

@@ -19,6 +19,9 @@ if TYPE_CHECKING:
     SGLANG_MINIMAX_H3_INT8_ENABLE: bool = True
     SGLANG_MINIMAX_H3_INT8_FUSION: bool = True
     SGLANG_MINIMAX_H3_FP8_OPTIMIZE: bool = True
+    SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS: str | None = None
+    SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
+    SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
     SGLANG_DIFFUSION_NCCL_SO_PATH: str | None = None
     LD_LIBRARY_PATH: str | None = None
     LOCAL_RANK: int = 0
@@ -170,6 +173,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "SGLANG_MINIMAX_H3_FP8_OPTIMIZE": _lazy_bool(
         "SGLANG_MINIMAX_H3_FP8_OPTIMIZE", "true"
+    ),
+    # Directory of the fused per-denoise-step output heads for a MiniMax-H3
+    # PDD-distilled checkpoint (see fuse_minimax_h3_pdd_heads.py). An ordinary
+    # run leaves it unset.
+    "SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS": _lazy_str(
+        "SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS"
+    ),
+    # GPU-resident AdaLN slot-timestep plans kept per GPU when the online
+    # AdaLN rebuild is enabled (9.25 MiB per slot-timestep; 64 x width 4 =
+    # 2.31 GiB). A request needs up to num_inference_steps slots; the default
+    # covers the 50-step serving schedule, so this is an escape hatch, not a
+    # deployment knob.
+    "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS": _lazy_int(
+        "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS", 64
+    ),
+    # Experimental: compute the online AdaLN rebuild projections once in fp32
+    # (TF32 off) before the bf16 store. Not bit-comparable to resident
+    # adaln_proj weights; keep off until an e2e trajectory gate clears it.
+    "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32"
     ),
     # ================== Installation Time Env Vars ==================
     # Target device of sglang-diffusion, supporting [cuda (by default),

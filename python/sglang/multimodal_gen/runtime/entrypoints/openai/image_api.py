@@ -38,6 +38,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     build_sampling_params,
     choose_output_image_ext,
     flatten_extra_params,
+    form_model_kwargs,
+    request_model_kwargs,
+    resolve_sampling_params_cls,
     merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
@@ -266,6 +269,14 @@ def _get_response_resize(
     return sampling_params.output_size_str()
 
 
+def _build_request_sampling_params(request_id: str, **kwargs):
+    # Request validation errors are client errors, as in the video API.
+    try:
+        return build_sampling_params(request_id, **kwargs)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
 @router.post("/generations", response_model=ImageResponse)
 async def generations(
     request: ImageGenerationsRequest,
@@ -273,6 +284,8 @@ async def generations(
 ):
     request_id = generate_request_id()
     server_args = get_global_server_args()
+    sampling_params_cls = resolve_sampling_params_cls(server_args)
+    model_kwargs = request_model_kwargs(request, sampling_params_cls, "image")
     is_cosmos3 = "cosmos3" in (server_args.model_path or "").lower()
     ext = (
         "png"
@@ -281,7 +294,7 @@ async def generations(
     )
 
     with temp_dir_if_disabled(server_args.output_path) as output_dir:
-        sampling = build_sampling_params(
+        sampling = _build_request_sampling_params(
             request_id,
             prompt=request.prompt,
             size=request.size,
@@ -335,6 +348,7 @@ async def generations(
                 request, "progressive_levels"
             ),
             progressive_delta=_get_request_field_or_extra(request, "progressive_delta"),
+            **model_kwargs,
         )
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(
@@ -441,6 +455,10 @@ async def edits(
 ):
     request_id = generate_request_id()
     server_args = get_global_server_args()
+    sampling_params_cls = resolve_sampling_params_cls(server_args)
+    model_kwargs = form_model_kwargs(
+        await raw_request.form(), sampling_params_cls, "image"
+    )
     # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
     images = image or image_array
     urls = url or url_array
@@ -475,7 +493,7 @@ async def edits(
             )
 
         ext = choose_output_image_ext(output_format, background)
-        sampling = build_sampling_params(
+        sampling = _build_request_sampling_params(
             request_id,
             prompt=prompt,
             size=size,
@@ -497,6 +515,7 @@ async def edits(
             enable_upscaling=enable_upscaling,
             upscaling_model_path=upscaling_model_path,
             upscaling_scale=upscaling_scale,
+            **model_kwargs,
         )
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(

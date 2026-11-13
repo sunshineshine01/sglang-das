@@ -20,14 +20,16 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_world_size,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import VaeFastPathGate
 
+from .batching import forward_many
 from .processor import (
     VAEProcessor,
     get_denormalize_transform,
     get_normalize_transform,
 )
 from .vae_cnn import EncoderFCN3D
-from .vae_vit import ViT3DDecoder
+from .vae_vit import ViT2DDecoder, ViT3DDecoder
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -82,7 +84,14 @@ class DiagonalGaussianDistribution(object):
 
     @torch.compiler.disable
     def sample(self, generator=None):
-        noise = torch.randn(self.mean.shape, generator=generator)
+        # No generator: the process-global CPU RNG (video keyframe encoding
+        # samples under a scoped, seeded fork of it). With one, draw on the
+        # generator's device.
+        noise = torch.randn(
+            self.mean.shape,
+            generator=generator,
+            device=None if generator is None else generator.device,
+        )
         noise = noise.to(device=self.parameters.device)
         return noise.mul_(self.std).add_(self.mean)
 
@@ -109,15 +118,6 @@ class ClsTokenAggregator:
         ):
             self.cls_tokens.append(self.vae.encoder.loss_info["cls_token"].clone())
 
-    def collect_stacked(self, num_tiles, sample_batch_size):
-        if (
-            hasattr(self.vae.encoder, "loss_info")
-            and "cls_token" in self.vae.encoder.loss_info
-        ):
-            cls_token = self.vae.encoder.loss_info["cls_token"]
-            cls_token = cls_token.unflatten(0, (num_tiles, sample_batch_size))
-            self.cls_tokens.extend(token.clone() for token in cls_token)
-
 
 class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
     r"""
@@ -138,7 +138,8 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         "encoder_tiling",
         "decoder_tiling",
         "parallel_tiling",
-        "stack_tiling",
+        "decoder_tile_batch",
+        "window_batch",
         "tile_size",
         "tile_overlap_min",
         "decoder_tile_size",
@@ -149,6 +150,10 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         "decoder_parallel",
         "chunk_dim",
     ]  # legacy config keys accepted by from_pretrained for checkpoint compatibility
+    # Set by minimax_h3_vae_cuda_opt at load and enabled per request by the
+    # decode stage from the quality tier; None keeps one tile and one window
+    # per decoder forward.
+    _sgl_gate: VaeFastPathGate | None = None
 
     def setup_forward(self, **kwargs):
         self.clip_length = kwargs.get("clip_length", 17)
@@ -167,6 +172,10 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         self.encoder_tiling = kwargs.get("encoder_tiling", False)
         self.decoder_tiling = kwargs.get("decoder_tiling", False)
         self.stack_tiling = kwargs.get("stack_tiling", False)
+        # Decoder tiles and temporal windows per forward while the decode gate
+        # is on (see MiniMaxH3VideoVAEConfig); 0 means all, 1 is the reference.
+        self.decoder_tile_batch = kwargs.get("decoder_tile_batch", 1)
+        self.window_batch = kwargs.get("window_batch", 1)
         self.tile_size = kwargs.get("tile_size", 256)
         self.tile_overlap_min = kwargs.get("tile_overlap_min", 64)
         self.decoder_tile_size = kwargs.get("decoder_tile_size", self.tile_size)
@@ -288,6 +297,12 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         else:
             return blended
 
+    def _batch_caps(self) -> tuple[int, int]:
+        # (tiles, windows) per decoder forward; the caps apply only under the gate.
+        if self._sgl_gate is not None and self._sgl_gate.enabled:
+            return self.decoder_tile_batch, self.window_batch
+        return 1, 1
+
     def _assemble_tiles(self, rows, y_overlap, x_overlap):
         output_height = sum(
             row[0].shape[-2] - (y_overlap[i] if i < len(rows) - 1 else 0)
@@ -374,25 +389,16 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         return list(range(tile_rank, num_tiles, tile_world_size))
 
     def _run_tile_tasks(
-        self, tiles, tile_indices, forward_fn, stack_tiling, cls_agg=None
+        self, tiles, tile_indices, forward_fn, cls_agg=None, *, tile_batch: int = 1
     ):
-        if stack_tiling and tile_indices:
-            sample_batch_size = tiles[0].shape[0]
-            tile_batch = torch.cat([tiles[idx] for idx in tile_indices], dim=0)
-            output_batch = forward_fn(tile_batch)
-            output_tiles = output_batch.unflatten(
-                0, (len(tile_indices), sample_batch_size)
-            ).unbind(dim=0)
-            if cls_agg is not None:
-                cls_agg.collect_stacked(len(tile_indices), sample_batch_size)
-            return list(output_tiles)
-
-        tasks = []
-        for idx in tile_indices:
-            tasks.append(forward_fn(tiles[idx]))
-            if cls_agg is not None:
-                cls_agg.collect()
-        return tasks
+        # tile_batch complete tiles per call, in order; 0 = all, 1 = the released recipe.
+        local = [tiles[index] for index in tile_indices]
+        if not local:
+            return []
+        capacity = (tile_batch or len(local)) * int(local[0].shape[0])
+        return forward_many(
+            local, forward=forward_fn, capacity=capacity, collector=cls_agg
+        )
 
     def tiled_encode(self, x):
         if self.parallel_tiling:  # Fast online encoding for large videos
@@ -422,11 +428,8 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             local_tile_indices = self._local_tile_indices(
                 num_tiles, tile_rank, tile_world_size
             )
-            stack_tiling = self.stack_tiling and not (
-                self.training and getattr(self.encoder, "mask_enabled", False)
-            )
             encoded_tasks = self._run_tile_tasks(
-                x_tiles, local_tile_indices, self.encode, stack_tiling, agg
+                x_tiles, local_tile_indices, self.encode, agg
             )
 
             if tile_world_size > 1:
@@ -488,11 +491,11 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         local_tile_indices = self._local_tile_indices(
             num_tiles, tile_rank, tile_world_size
         )
-        stack_tiling = self.stack_tiling and not (
-            self.training and getattr(self.decoder, "mask_enabled", False)
-        )
+        tile_batch, _ = self._batch_caps()
+        if self.training and self.decoder.mask_enabled:
+            tile_batch = 1
         decoded_tasks = self._run_tile_tasks(
-            z_tiles, local_tile_indices, self.decode, stack_tiling
+            z_tiles, local_tile_indices, self.decode, tile_batch=tile_batch
         )
 
         if tile_world_size > 1:
@@ -928,6 +931,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         transform_input: bool = False,
         use_fp16_latent: bool = False,
         verbose: bool = False,
+        generator: Union[torch.Generator, None] = None,
     ) -> List[torch.Tensor]:
         """encode images into latents
 
@@ -943,6 +947,8 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 Whether to use fp16 latent. Defaults to False.
             verbose (bool, optional):
                 Whether to print debug information. Defaults to False.
+            generator (torch.Generator, optional):
+                RNG for the posterior sample. Defaults to the global CPU RNG.
 
         Returns:
             List[torch.Tensor]:
@@ -986,7 +992,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             stacked = torch.cat(prepared, dim=0)
             if verbose:
                 logger.info(f"batch encode input shape {tuple(stacked.shape)}")
-            all_latents = self.encode_base(stacked, True)
+            all_latents = self.encode_base(stacked, True, generator=generator)
             image_latents = [
                 all_latents[i].contiguous() for i in range(all_latents.shape[0])
             ]
@@ -995,7 +1001,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             for image_tensor in prepared:
                 if verbose:
                     logger.info(f"input shape {tuple(image_tensor.shape)}")
-                image_latent = self.encode_base(image_tensor, True)
+                image_latent = self.encode_base(image_tensor, True, generator=generator)
                 image_latents.append(image_latent.squeeze(0).contiguous())
 
         if use_fp16_latent:
@@ -1220,6 +1226,8 @@ class AutoencoderKLLegacy(AutoencoderKL):
         causal_decoder=True,
         use_vit_decoder=False,
         vit_decoder_kwargs=None,
+        # 2D image ViT decoder (Conv2d post_quant_conv) over one latent frame
+        vit_decoder_2d=False,
         # stats
         shift_factor=0.0,
         scaling_factor=1.0,
@@ -1279,9 +1287,11 @@ class AutoencoderKLLegacy(AutoencoderKL):
 
         # init pointwise quant/post_quant conv
         self.quant_conv = nn.Conv3d(z_channels * 2, 2 * embed_dim, 1)
-        self.post_quant_conv = nn.Conv3d(embed_dim, z_channels, 1)
+        post_quant_conv_cls = nn.Conv2d if vit_decoder_2d else nn.Conv3d
+        self.post_quant_conv = post_quant_conv_cls(embed_dim, z_channels, 1)
 
         self.use_vit_decoder = use_vit_decoder
+        self.vit_decoder_2d = vit_decoder_2d
 
         # init decoder
         vit_kwargs = {
@@ -1290,9 +1300,12 @@ class AutoencoderKLLegacy(AutoencoderKL):
             "out_channels": out_ch,
             **(vit_decoder_kwargs or {}),
         }
-        vit_kwargs.setdefault("patch_size_t", self.vae_ratio_t)
-        vit_kwargs.setdefault("t_causal", causal_decoder)
-        self.decoder = ViT3DDecoder(**vit_kwargs)
+        if vit_decoder_2d:
+            self.decoder = ViT2DDecoder(patch_size_t=1, t_causal=False, **vit_kwargs)
+        else:
+            vit_kwargs.setdefault("patch_size_t", self.vae_ratio_t)
+            vit_kwargs.setdefault("t_causal", causal_decoder)
+            self.decoder = ViT3DDecoder(**vit_kwargs)
 
     @torch.no_grad()
     def encode(self, x):
@@ -1300,12 +1313,15 @@ class AutoencoderKLLegacy(AutoencoderKL):
 
     @torch.no_grad()
     def decode(self, z):
+        if self.vit_decoder_2d:
+            # Tiling stays BC1HW; the image decoder consumes the single frame.
+            return self.decoder(self.post_quant_conv(z.squeeze(2))).unsqueeze(2)
         z2 = self.post_quant_conv(z)
         if self.use_vit_decoder:
             return self.decoder(z2)
         return self.decoder(z2, z)
 
-    def encode_base(self, input, process_image=False):
+    def encode_base(self, input, process_image=False, generator=None):
         if self.use_3d_conv and input.ndim == 4:
             input = input.unsqueeze(2)
 
@@ -1314,7 +1330,7 @@ class AutoencoderKLLegacy(AutoencoderKL):
         else:
             moments = self.encode_temporal(input)
 
-        z = DiagonalGaussianDistribution(moments).sample()
+        z = DiagonalGaussianDistribution(moments).sample(generator=generator)
 
         if process_image and self.use_3d_conv:
             z = self.trim_code(z, 1)

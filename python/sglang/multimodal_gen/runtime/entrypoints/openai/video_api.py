@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     build_sampling_params,
     flatten_extra_params,
     merge_image_input_list,
+    parse_form_extra_value,
     process_generation_batch,
     save_image_to_path,
 )
@@ -109,15 +110,6 @@ def _extra_value(request: VideoGenerationsRequest, name: str) -> Any:
 
 def _request_value(request: VideoGenerationsRequest, name: str) -> Any:
     return _extra_value(request, name)
-
-
-def _parse_form_extra_value(value: Any) -> Any:
-    if not isinstance(value, str):
-        return value
-    try:
-        return json.loads(value)
-    except Exception:
-        return value
 
 
 _MULTIPART_EXTRA_FORM_FIELDS = (
@@ -197,7 +189,7 @@ def _merge_multipart_extra_form_fields(
 ) -> None:
     for key in _multipart_extra_form_keys(sampling_params_cls):
         if key in raw_form and key not in extra_from_form:
-            extra_from_form[key] = _parse_form_extra_value(raw_form[key])
+            extra_from_form[key] = parse_form_extra_value(raw_form[key])
 
 
 def _multipart_video_extras(
@@ -266,7 +258,7 @@ def _normalize_optional_string(value: Any) -> Any:
 
 
 def _coerce_optional_int_list(value: Any) -> list[int] | None:
-    value = _parse_form_extra_value(value)
+    value = parse_form_extra_value(value)
     if value is None:
         return None
     if isinstance(value, str) and not value.strip():
@@ -346,7 +338,7 @@ def _cosmos3_sampling_param_kwargs(
         "action_view_point",
         "action_normalization",
     ):
-        value = _parse_form_extra_value(_request_value(req, name))
+        value = parse_form_extra_value(_request_value(req, name))
         value = _normalize_optional_string(value)
         if value is not None:
             kwargs[name] = value
@@ -814,13 +806,13 @@ async def create_video(
 
         def form_value(name: str, value: Any) -> Any:
             selected = value if value is not None else extra_from_form.get(name)
-            return _parse_form_extra_value(selected)
+            return parse_form_extra_value(selected)
 
         def form_text_value(name: str, value: Any) -> Any:
             """Resolve a text field without JSON-decoding it.
 
             Some models take a serialized JSON object as the prompt text, which
-            ``_parse_form_extra_value`` would turn back into a dict and fail
+            ``parse_form_extra_value`` would turn back into a dict and fail
             request validation.
             """
             return value if value is not None else extra_from_form.get(name)

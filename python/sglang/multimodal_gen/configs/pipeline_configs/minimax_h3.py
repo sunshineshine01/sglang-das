@@ -101,6 +101,36 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     def _server_arg_value(value):
         return getattr(value, "value", value)
 
+    def resolve_transformer_attention_backend(
+        self, server_args
+    ) -> AttentionBackendEnum | None:
+        """Resolve the H3 DiT backend using the selector's precedence."""
+        from sglang.multimodal_gen.runtime.layers.attention.selector import (
+            get_global_forced_attn_backend,
+        )
+
+        selected_backend = get_global_forced_attn_backend()
+        if selected_backend is None:
+            selected_backend, _ = server_args.resolve_component_attention_backend(
+                "transformer"
+            )
+        if selected_backend is not None:
+            return selected_backend
+        attention_backend = server_args.attention_backend
+        if attention_backend is None or isinstance(
+            attention_backend, AttentionBackendEnum
+        ):
+            return attention_backend
+        attention_backend = self._server_arg_value(attention_backend)
+        return AttentionBackendEnum[str(attention_backend).strip().upper()]
+
+    def uses_subblock_attention(self, server_args) -> bool:
+        """Return whether H3 must build SubBlock-only request metadata."""
+        return (
+            self.resolve_transformer_attention_backend(server_args)
+            is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+        )
+
     def validate_quality_deployment(self, server_args) -> None:
         """Fail closed unless the resident server matches the deployment
         audited for quality="high"."""

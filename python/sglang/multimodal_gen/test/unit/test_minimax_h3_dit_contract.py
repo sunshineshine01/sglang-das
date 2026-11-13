@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
     Fp8Config,
     Fp8LinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
 from sglang.multimodal_gen.runtime.layers.usp import _usp_input_all_to_all_packed_qkv
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
@@ -226,6 +227,7 @@ def test_cache_dit_input_preservation_toggles_every_block():
     model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
     torch.nn.Module.__init__(model)
     model.blocks = torch.nn.ModuleList([torch.nn.Identity() for _ in range(5)])
+    model.arch = MiniMaxH3DiTArchConfig()
 
     model.set_cache_dit_input_preservation(True)
     assert all(block.preserve_input_for_cache_dit for block in model.blocks)
@@ -381,6 +383,34 @@ def test_online_fp8_keeps_fp32_boundaries_and_ignored_layers_unquantized():
         model.final_layer.audio_out,
     ):
         assert isinstance(layer.quant_method, UnquantizedLinearMethod)
+
+
+@pytest.mark.parametrize("quant_config_cls", [Fp8Config, MXFP8Config])
+def test_online_fp8_adaln_uses_native_checkpoint_projections(quant_config_cls):
+    with torch.device("meta"):
+        model = MiniMaxH3DiTModel(
+            config=MiniMaxH3DiTConfig(),
+            hf_config={},
+            quant_config=quant_config_cls(),
+            adaln_weight_files=["native-bf16.safetensors"],
+        )
+    assert model.adaln_cache.weight_files == ["native-bf16.safetensors"]
+    assert model.blocks[0].adaln_proj is None
+    assert model.final_layer.adaln_proj is None
+    assert isinstance(model.blocks[0].attn.qkv_proj.quant_method, Fp8LinearMethod)
+    assert isinstance(model.time_embedder.proj_in.quant_method, UnquantizedLinearMethod)
+    assert isinstance(model.final_layer.video_out.quant_method, UnquantizedLinearMethod)
+
+
+@pytest.mark.parametrize("quant_config_cls", [Fp8Config, MXFP8Config])
+def test_adaln_rebuild_rejects_serialized_quantized_weights(quant_config_cls):
+    with pytest.raises(ValueError, match="native checkpoint weights"):
+        MiniMaxH3DiTModel(
+            config=MiniMaxH3DiTConfig(),
+            hf_config={},
+            quant_config=quant_config_cls(is_checkpoint_fp8_serialized=True),
+            adaln_weight_files=["quantized.safetensors"],
+        )
 
 
 def test_sdpa_varlen_fallback_matches_naive_packed_reference():

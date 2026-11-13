@@ -3,7 +3,7 @@ import queue
 import re
 import threading
 from collections.abc import Mapping, Sequence
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from time import perf_counter
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -453,6 +453,7 @@ class LayerwiseOffloadManager:
         self._courier_inflight: Set[int] = set()
         # layer_idx -> torch.get_device_module().Event for fine-grained sync, to make sure the weight is resident in pre-hook
         self._prefetch_events: Dict[int, torch.get_device_module().Event] = {}
+        self._graph_capture_keepalive: list[Any] | None = None
 
         self._named_parameters: Dict[str, torch.nn.Parameter] = {}
         self._named_buffers: Dict[str, torch.Tensor] = {}
@@ -872,6 +873,8 @@ class LayerwiseOffloadManager:
         """
         Prepare for the next round of denoising loop with prefetching the necessary layers
         """
+        if getattr(self, "_graph_capture_keepalive", None) is not None:
+            non_blocking = True
         # The resident set first: it has to be there for the whole step, and the
         # caller decides whether to block on it.
         for layer_idx in sorted(self._retained_set):
@@ -944,6 +947,9 @@ class LayerwiseOffloadManager:
         """
         if not self.enabled or self.device is None:
             return
+        capture_keepalive = getattr(self, "_graph_capture_keepalive", None)
+        if capture_keepalive is not None:
+            non_blocking = True
         if layer_idx < 0 or layer_idx >= self.num_layers:
             return
         if layer_idx in self._gpu_layers:
@@ -1051,7 +1057,11 @@ class LayerwiseOffloadManager:
 
         if self.copy_stream is not None:
             # record after all copies so the consumer waits for every weight copy
-            event = torch.get_device_module().Event()
+            event = torch.get_device_module().Event(
+                **({"external": True} if capture_keepalive is not None else {})
+            )
+            if capture_keepalive is not None:
+                capture_keepalive.append(event)
             event.record(self.copy_stream)
             self._prefetch_events[layer_idx] = event
 
@@ -1841,6 +1851,209 @@ class LayerwiseOffloadableModuleMixin:
                 manager.sync_all_layers_to_cpu()
                 manager.release_all()
                 manager.register_forward_hooks()
+
+
+@contextmanager
+def capture_layerwise_offload(model: torch.nn.Module, stream):
+    """Capture pinned weight copies and retain their graph-owned lifetimes."""
+    if not isinstance(model, torch.nn.Module):
+        yield []
+        return
+    managers = list(
+        dict.fromkeys(
+            manager
+            for module in model.modules()
+            for manager in getattr(module, "layerwise_offload_managers", ()) or ()
+            if manager.enabled
+        )
+    )
+    keepalive = []
+    if not managers:
+        yield keepalive
+        return
+    for manager in managers:
+        stores = (
+            manager._consolidated_cpu_weights,
+            manager._strided_cpu_weights,
+            manager._mapped_cpu_weights,
+        )
+        sources = [
+            tensor
+            for store in stores
+            for layer in store.values()
+            for tensor in layer.values()
+        ]
+        if manager.device.type != "cuda" or any(
+            tensor.numel() and not tensor.is_pinned() for tensor in sources
+        ):
+            raise ValueError(
+                "Layerwise graph capture requires pinned CUDA weight sources"
+            )
+        keepalive.extend(sources)
+
+    previous = []
+    try:
+        for manager in managers:
+            # Include the first layer's copy in every replay; a prefetch from
+            # the eager warmup must not become an uncaptured dependency.
+            manager.release_all()
+            previous.append((manager, manager.copy_stream))
+            manager.copy_stream = stream
+            manager._graph_capture_keepalive = keepalive
+        # Component residency may rebind non-layer weights after capture.
+        # Keep the original storage alive until the graph itself is dropped.
+        keepalive.extend(
+            tensor.detach()
+            for tensor in (*model.parameters(), *model.buffers())
+            if tensor.device.type == "cuda" and tensor.numel()
+        )
+        yield keepalive
+    finally:
+        for manager, copy_stream in reversed(previous):
+            manager.release_all()
+            manager._graph_capture_keepalive = None
+            manager.copy_stream = copy_stream
+
+
+def is_offload_placeholder(tensor: torch.Tensor) -> bool:
+    return getattr(tensor, "numel", lambda: 0)() <= 1
+
+
+def offload_param_name_aliases(name: str) -> tuple[str, ...]:
+    """``name`` and its ``*.base_layer.*`` counterpart."""
+    names = [name]
+    if ".base_layer." in name:
+        names.append(name.replace(".base_layer.", "."))
+    else:
+        head, sep, leaf = name.rpartition(".")
+        if sep:
+            names.append(f"{head}.base_layer.{leaf}")
+    return tuple(dict.fromkeys(names))
+
+
+def refresh_layerwise_targets(module: torch.nn.Module) -> None:
+    """Repoint every manager at live Parameters after LoRA wrap."""
+    if not is_layerwise_offloaded_module(module):
+        return
+    for manager in module.layerwise_offload_managers:
+        manager.refresh_named_targets()
+
+
+def _refresh_packed_from_manager(layer: torch.nn.Module) -> None:
+    """Re-bind ``_packed_weight_cpu`` after the manager store is replaced."""
+    root = getattr(layer, "_offload_root", None)
+    prefix = getattr(layer, "_offload_param_prefix", None)
+    if root is None or prefix is None:
+        return
+    name = f"{prefix}.weight"
+    for manager in getattr(root, "layerwise_offload_managers", None) or []:
+        getter = getattr(manager, "get_cpu_weight", None)
+        if not callable(getter):
+            continue
+        tensor = getter(name)
+        if tensor is not None:
+            layer._packed_weight_cpu = tensor.detach()
+            return
+
+
+def _release_stale_gpu_layer(layer: torch.nn.Module) -> None:
+    """Release a stale GPU copy so the next prefetch reloads from CPU."""
+    root = getattr(layer, "_offload_root", None)
+    prefix = getattr(layer, "_offload_param_prefix", None)
+    if root is None or prefix is None:
+        return
+    name = f"{prefix}.weight"
+    for manager in getattr(root, "layerwise_offload_managers", None) or []:
+        match = getattr(manager, "_match_layer_idx", None)
+        if not callable(match):
+            continue
+        layer_idx = match(name)
+        if layer_idx is None:
+            continue
+        gpu_layers = getattr(manager, "_gpu_layers", None)
+        if gpu_layers and layer_idx in gpu_layers:
+            manager.release_layer(layer_idx, force=True)
+
+
+def copy_into_packed_view(dest: torch.Tensor | None, src: torch.Tensor) -> bool:
+    """Copy ``src`` into an offload CPU view. Refuse dtype/shape casts."""
+    if dest is None or is_offload_placeholder(dest):
+        return False
+    src = src.detach()
+    if dest.shape != src.shape or dest.dtype != src.dtype:
+        return False
+    dest.copy_(src)
+    return True
+
+
+def write_offload_params(
+    layer: torch.nn.Module, tensors: dict[str, torch.Tensor]
+) -> bool:
+    """Write weights into layerwise CPU buffers, not GPU placeholders."""
+    root = getattr(layer, "_offload_root", None)
+    prefix = getattr(layer, "_offload_param_prefix", None)
+    if root is None or prefix is None:
+        return False
+    managers = getattr(root, "layerwise_offload_managers", None)
+    if not managers:
+        return False
+    named = {f"{prefix}.{key}": value for key, value in tensors.items()}
+    owned: dict[str, object] = {}
+    for manager in managers:
+        if not getattr(manager, "enabled", False):
+            continue
+        for name in named:
+            if name in owned:
+                continue
+            has = getattr(manager, "has_cpu_weight", None)
+            if callable(has) and has(name):
+                owned[name] = manager
+    if not owned:
+        return False
+    missing: list[str] = []
+    for name, value in named.items():
+        manager = owned.get(name)
+        if manager is None:
+            continue
+        updated = manager.update_cpu_weights({name: value}) or set()
+        if name not in updated:
+            missing.append(name)
+    if missing:
+        raise RuntimeError(
+            f"layerwise LoRA writeback missed {missing} (prefix={prefix})"
+        )
+    _refresh_packed_from_manager(layer)
+    return True
+
+
+def finish_offload_writeback() -> None:
+    """No-op; writeback is already synchronous."""
+    return
+
+
+def write_dense_weight(layer: torch.nn.Module, weight: torch.Tensor) -> None:
+    """Write into the manager/view store. Do not replace the Parameter object."""
+    dest = layer.weight
+    if hasattr(dest, "to_local"):
+        dest = dest.to_local()
+    if write_offload_params(layer, {"weight": weight}):
+        _release_stale_gpu_layer(layer)
+        return
+    packed_view = getattr(layer, "_packed_weight_cpu", None)
+    if copy_into_packed_view(packed_view, weight):
+        _release_stale_gpu_layer(layer)
+        return
+    if is_offload_placeholder(dest):
+        raise RuntimeError(
+            "layerwise LoRA writeback has no manager CPU view for a (1,) "
+            "placeholder; convert_to_lora_layers must bind the offload root "
+            "and _packed_weight_cpu first."
+        )
+    packed = weight.detach().to(device=dest.device, dtype=dest.dtype)
+    if dest.data.is_inference() or dest.dtype != packed.dtype:
+        dest.data = packed
+    else:
+        dest.data.copy_(packed)
 
 
 def iter_materialized_weights(module: torch.nn.Module):

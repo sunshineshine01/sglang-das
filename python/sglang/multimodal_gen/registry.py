@@ -347,6 +347,9 @@ def register_configs(
     pipeline_config_cls: Type[PipelineConfig],
     hf_model_paths: Optional[List[str]] = None,
     model_detectors: Optional[List[Callable[[str], bool]]] = None,
+    pipeline_config_registry_entries: Optional[
+        Dict[str, Tuple[Type[PipelineConfig], Type[Any]]]
+    ] = None,
 ) -> str:
     """
     Registers configuration classes for a new model family.
@@ -368,6 +371,11 @@ def register_configs(
     if model_detectors:
         for detector in model_detectors:
             _MODEL_NAME_DETECTORS.append((model_id, detector))
+
+    if pipeline_config_registry_entries:
+        for pipeline_name, (pc_cls, sp_cls) in pipeline_config_registry_entries.items():
+            _PIPELINE_CONFIG_REGISTRY.setdefault(pipeline_name, (pc_cls, sp_cls))
+
     return model_id
 
 
@@ -439,11 +447,21 @@ def get_model_short_name(model_id: str) -> str:
 
 
 def _normalize_hf_cache_path(path: str) -> str:
-    """Normalize a local HuggingFace cache path before substring matching.
+    """Normalize a local HuggingFace cache path before matching repo directories.
 
-    We match registered repo ids like ``org/repo`` against cache fragments like ``models--org--repo`` that appear in snapshot/blob paths.
+    We match registered repo ids like ``org/repo`` against cache directories like ``models--org--repo`` that appear in snapshot/blob paths.
     """
     return os.path.normpath(path).lower().replace("\\", "/")
+
+
+def _in_hf_cache_repo(normalized_path: str, repo_id: str) -> bool:
+    """Whether a normalized path lies in the HF cache directory of ``repo_id``.
+
+    The cache directory must be a whole path component, so the cache of
+    ``org/repo`` does not claim the cache of ``org/repo-image``.
+    """
+    cache_repo_dir = f"models--{repo_id.lower().replace('/', '--')}"
+    return cache_repo_dir in normalized_path.split("/")
 
 
 def has_registered_diffusion_model_path(model_path: str) -> bool:
@@ -461,10 +479,7 @@ def has_registered_diffusion_model_path(model_path: str) -> bool:
 
     normalized_model_path = _normalize_hf_cache_path(model_path)
     for registered_model_hf_id in all_model_hf_paths:
-        cache_repo_fragment = (
-            f"models--{registered_model_hf_id.lower().replace('/', '--')}"
-        )
-        if cache_repo_fragment in normalized_model_path:
+        if _in_hf_cache_repo(normalized_model_path, registered_model_hf_id):
             return True
 
     return False
@@ -518,13 +533,10 @@ def _get_config_info(
     # when its basename is only the snapshot hash.
     # Example:
     #    /xxx/models--black-forest-labs--FLUX.2-dev-NVFP4/snapshots/142b87e70bc3006937b7093d89ff287b5f59f071
-    # -> models--black-forest-labs--flux.2-dev-nvfp4 (to match with cache_repo_fragment)
+    # -> models--black-forest-labs--flux.2-dev-nvfp4 (a whole path component)
     normalized_model_path = _normalize_hf_cache_path(model_path)
     for registered_model_hf_id in all_model_hf_paths:
-        cache_repo_fragment = (
-            f"models--{registered_model_hf_id.lower().replace('/', '--')}"
-        )
-        if cache_repo_fragment in normalized_model_path:
+        if _in_hf_cache_repo(normalized_model_path, registered_model_hf_id):
             logger.debug(
                 "Resolved HuggingFace cache path '%s' to registered model '%s'.",
                 model_path,
@@ -965,10 +977,16 @@ def _register_configs():
             "MiniMax/MiniMax-H3",
         ],
         model_detectors=[
-            lambda model_id: "minimaxh3"
-            in model_id.lower().replace("-", "").replace("_", "")
+            lambda model_id: (
+                "minimaxh3" in model_id.lower().replace("-", "").replace("_", "")
+                and "minimaxh3image"
+                not in model_id.lower().replace("-", "").replace("_", "")
+            )
         ],
     )
+    from sglang.multimodal_gen.configs.pipeline_configs import minimax_h3_image
+
+    minimax_h3_image.register()
     # FLUX
     register_configs(
         sampling_param_cls=FluxSamplingParams,
@@ -1346,7 +1364,7 @@ def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
         if "/" in pattern and (
             normalized_model_path == pattern
             or model_short_name == get_model_short_name(pattern)
-            or f"models--{pattern.replace('/', '--')}" in normalized_model_path
+            or _in_hf_cache_repo(normalized_model_path, pattern)
         ):
             return pipeline_name
     return None

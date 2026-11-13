@@ -80,6 +80,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
 )
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 from sglang.multimodal_gen.runtime.weights.source import (
     is_explicit_weight_file_reference,
 )
@@ -108,6 +109,44 @@ def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
     if mode is None:
         return None
     return mode.lower()
+
+
+def _infer_direct_constructor_explicit_arg_names(server_args) -> set[str]:
+    explicit_arg_names: set[str] = set()
+    for attr in dataclasses.fields(server_args):
+        if not attr.init or attr.name == "_explicit_arg_names":
+            continue
+
+        value = getattr(server_args, attr.name)
+        if attr.default is not dataclasses.MISSING:
+            default = attr.default
+        elif attr.default_factory is not dataclasses.MISSING:
+            default = attr.default_factory()
+        else:
+            explicit_arg_names.add(attr.name)
+            continue
+
+        if value != default:
+            explicit_arg_names.add(attr.name)
+
+    return explicit_arg_names
+
+
+def _normalize_component_precisions(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ValueError("component_precisions must be a mapping")
+
+    normalized: dict[str, str] = {}
+    for component, precision in value.items():
+        component_name = str(component).strip().replace("-", "_")
+        precision_name = str(precision).strip().lower()
+        if not component_name or precision_name not in PRECISION_TO_TYPE:
+            raise ValueError(
+                "Component precision entries require a component and one of "
+                f"{sorted(PRECISION_TO_TYPE)}"
+            )
+        normalized[component_name] = precision_name
+    return normalized
 
 
 def is_ltx2_two_stage_pipeline_name(pipeline_class_name: str | None) -> bool:
@@ -172,7 +211,9 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "ltx-2",
         "ltx-2.3",
         "minimax-h3",
+        "minimax-h3-image",
         "minimaxai/minimax-h3",
+        "minimaxai/minimax-h3-image",
         "qwen/qwen-image",
         "qwen/qwen-image-2512",
         "qwen-image",
@@ -193,6 +234,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "LTX23PipelineConfig",
         "LongCatImagePipelineConfig",
         "MiniMaxH3PipelineConfig",
+        "MiniMaxH3ImagePipelineConfig",
         "QwenImagePipelineConfig",
         "SanaPipelineConfig",
         "SanaVideoPipelineConfig",
@@ -236,6 +278,11 @@ class ServerArgs(DisaggServerArgsMixin):
     attention_backend_config: addict.Dict | None = None
     component_attention_backends: dict[str, str] | str | None = field(
         default_factory=dict
+    )
+    # Snapshot of what the user explicitly asked for, taken before automatic
+    # adjustments add entries of their own (compare=False: derived state).
+    _requested_component_attention_backends: dict[str, str] | None = field(
+        default=None, repr=False, compare=False
     )
     cache_dit_config: str | dict[str, Any] | None = (
         None  # cache-dit config for diffusers
@@ -310,6 +357,12 @@ class ServerArgs(DisaggServerArgsMixin):
     component_paths: dict[str, str] = field(default_factory=dict)
     # Exact weight-file overrides retain the base component configuration.
     component_weights_paths: dict[str, str] = field(default_factory=dict)
+    # Explicit quantization override for one component. Self-describing
+    # checkpoints remain auto-detected and do not need this override.
+    component_quantizations: dict[str, str] = field(default_factory=dict)
+    # Exact load and execution precision overrides for components whose native
+    # loader advertises this capability.
+    component_precisions: dict[str, str] = field(default_factory=dict)
     # Optional LTX-2.5 decoder is large enough to load only when requested.
     load_diffusion_decoder: bool = False
 
@@ -317,11 +370,13 @@ class ServerArgs(DisaggServerArgsMixin):
     transformer_weights_path: str | None = None
     # path to precomputed MiniMax H3 AdaLN outputs for inference-only serving.
     minimax_h3_adaln_cache_path: str | None = None
-    # Rebuild AdaLN outputs per request from the checkpoint, no sidecar needed.
-    minimax_h3_adaln_online: bool = False
-    # Widest timestep plan the rebuild slab is sized for; see
-    # MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
-    minimax_h3_adaln_plan_width: int = 4
+    # None lets the model choose; False explicitly keeps resident projections.
+    minimax_h3_adaln_online: bool | None = None
+    # None chooses 2 for image releases, otherwise MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
+    minimax_h3_adaln_plan_width: int | None = None
+    # Pinned-host cache for built AdaLN plans (decimal GB, 0 disables); None
+    # lets the model choose. Image releases set it to 0.
+    minimax_h3_adaln_host_cache_gb: float | None = None
     # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
     # When set, the transformer loader uses it instead of auto-detection.
     quantization: str | None = None
@@ -641,23 +696,25 @@ class ServerArgs(DisaggServerArgsMixin):
 
         pipeline_config = getattr(self, "pipeline_config", None)
         pipeline_config_name = type(pipeline_config).__name__
-        if (
+        # The lists record validated checkpoints, not what can capture. An
+        # explicit request elsewhere stays on with a warning: warmup reports a
+        # denoising stage that captures nothing, and a captured segment that
+        # branches on Python-side state replays its capture-time branch.
+        if not (
             pipeline_config_name in BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
             and self._is_breakable_cuda_graph_supported_model()
         ):
-            if not self.warmup_resolutions:
-                self._default_bcg_warmup_resolution()
-            return
-
-        logger.warning(
-            "[Diffusion BCG] disabled for %s: only Ideogram-4, "
-            "Lightricks/LTX-2, LongCat-Image, MiniMax-H3, "
-            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, SANA-Video, "
-            "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image are "
-            "currently supported.",
-            pipeline_config_name,
-        )
-        self.enable_breakable_cuda_graph = False
+            logger.warning(
+                "[Diffusion BCG] not validated for %s (%s); enabling it as "
+                "requested. Warmup warns if nothing gets captured; compare "
+                "outputs against eager before relying on it.",
+                pipeline_config_name,
+                self.model_path,
+            )
+        # ComfyUI requests carry the sampler's tensors, which a synthetic warmup
+        # cannot build; the ComfyUI step stage captures on its first real step.
+        if not self.warmup_resolutions and not self.comfyui_mode:
+            self._default_bcg_warmup_resolution()
 
     def _is_breakable_cuda_graph_supported_model(self) -> bool:
         refs = _normalized_bcg_model_refs(self.model_id)
@@ -926,6 +983,12 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.component_attention_backends
             )
         )
+        # Snapshot what the user asked for before the pipeline-specific
+        # adjustments below add any automatic entries of our own.
+        if self._requested_component_attention_backends is None:
+            self._requested_component_attention_backends = dict(
+                self.component_attention_backends
+            )
 
         if (
             self.backend != Backend.DIFFUSERS
@@ -1136,6 +1199,16 @@ class ServerArgs(DisaggServerArgsMixin):
                 raise ValueError("Component attention backend key must not be empty")
             normalized[component_name] = cls._normalize_attention_backend_name(backend)
         return normalized
+
+    def requested_component_attention_backend(
+        self, component_name: str
+    ) -> str | None:
+        """What the user explicitly requested for a component, if anything."""
+        assert self._requested_component_attention_backends is not None
+        return self._requested_component_attention_backends.get(component_name)
+
+    def has_requested_component_attention_backends(self) -> bool:
+        return bool(self._requested_component_attention_backends)
 
     def resolve_component_attention_backend(
         self, *component_names: str | None
@@ -1718,6 +1791,11 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError(f"Could not parse attention backend config: {config_str}")
 
     def __post_init__(self):
+        if not self._explicit_arg_names:
+            self._explicit_arg_names = _infer_direct_constructor_explicit_arg_names(
+                self
+            )
+
         # configure logger before use
         configure_logger(server_args=self)
 
@@ -1745,6 +1823,25 @@ class ServerArgs(DisaggServerArgsMixin):
             component_weights_paths[component] = path
         self.component_paths = component_paths
         self.component_weights_paths = component_weights_paths
+        self.component_precisions = _normalize_component_precisions(
+            self.component_precisions
+        )
+        normalized_quantizations: dict[str, str] = {}
+        for component, quantization in self.component_quantizations.items():
+            component = str(component).strip().replace("-", "_")
+            quantization = str(quantization).strip().lower()
+            if not component or not quantization:
+                raise ValueError(
+                    "Component quantization entries require a component and method"
+                )
+            previous = normalized_quantizations.get(component)
+            if previous is not None and previous != quantization:
+                raise ValueError(
+                    f"Conflicting quantization overrides for {component!r}: "
+                    f"{previous!r} and {quantization!r}"
+                )
+            normalized_quantizations[component] = quantization
+        self.component_quantizations = normalized_quantizations
 
         # Convert string disagg_role to enum (from CLI/config)
         if isinstance(self.disagg_role, str):
@@ -1811,7 +1908,7 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.minimax_h3_adaln_plan_width,
             help=(
                 "Widest timestep plan --minimax-h3-adaln-online sizes its slab "
-                "for. The default 4 covers every task; a deployment serving "
+                "for. By default 2 for image releases, otherwise 4 which covers every task; a deployment serving "
                 "only t2va (2) or fl2va (3) can shrink the slab proportionally. "
                 "A request exceeding it is rejected rather than truncated."
             ),

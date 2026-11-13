@@ -1,5 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import asyncio
+import dataclasses
 import inspect
 import json
 import os
@@ -7,10 +8,12 @@ import shutil
 import tempfile
 import time
 from contextlib import contextmanager
-from typing import Any, Generator, List, Optional, Union
+from functools import cache
+from typing import Any, Generator, List, Literal, Optional, Union
 
 import httpx
 from fastapi import HTTPException, UploadFile
+from pydantic import BaseModel
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
@@ -95,6 +98,164 @@ def flatten_extra_params(payload: Any) -> dict[str, Any]:
     return payload
 
 
+def resolve_sampling_params_cls(server_args: Any) -> type[SamplingParams]:
+    """Resolve the model-owned sampling contract selected for this server.
+
+    Shared API code must dispatch through this type instead of branching on a
+    model ID or importing individual model configurations.
+    """
+
+    sampling_params_cls = SamplingParams
+    if server_args.pipeline_class_name:
+        from sglang.multimodal_gen.registry import get_pipeline_config_classes
+
+        config_classes = get_pipeline_config_classes(server_args.pipeline_class_name)
+        if config_classes is not None:
+            _, sampling_params_cls = config_classes
+    if sampling_params_cls is SamplingParams:
+        from sglang.multimodal_gen.registry import get_model_info
+
+        model_info = get_model_info(
+            server_args.model_path,
+            backend=server_args.backend,
+            model_id=server_args.model_id,
+        )
+        if model_info is not None:
+            sampling_params_cls = model_info.sampling_param_cls
+    return sampling_params_cls
+
+
+_REQUEST_EXTRA_CONTAINERS = (
+    "extra_body",
+    "extra_json",
+    "extra_args",
+    "extra_params",
+)
+
+
+def _parse_request_extra_container(value: Any) -> dict[str, Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return {}
+    if not isinstance(value, dict):
+        return {}
+    return flatten_extra_params(dict(value))
+
+
+def request_extra_value(request: Any, field_name: str) -> Any:
+    """Read an extension field while preserving top-level precedence.
+
+    This function only handles transport compatibility. Callers must first use
+    the active SamplingParams subclass to decide which model-owned fields are
+    valid; transport helpers must not introduce per-model allowlists.
+    """
+
+    extra = dict(getattr(request, "model_extra", None) or {})
+    direct = {
+        key: value
+        for key, value in extra.items()
+        if key not in _REQUEST_EXTRA_CONTAINERS
+    }
+    direct = flatten_extra_params(direct)
+    if field_name in direct and direct[field_name] is not None:
+        return direct[field_name]
+
+    for container_name in _REQUEST_EXTRA_CONTAINERS:
+        nested = _parse_request_extra_container(extra.get(container_name))
+        if field_name in nested and nested[field_name] is not None:
+            return nested[field_name]
+    return None
+
+
+def request_field_value(request: BaseModel, field_name: str) -> Any:
+    """Prefer a non-None protocol field over transport extras."""
+    value = vars(request).get(field_name)
+    if value is not None:
+        return value
+    return request_extra_value(request, field_name)
+
+
+@cache
+def get_declared_request_extra_fields(
+    sampling_params_cls: type[SamplingParams],
+    api: Literal["image", "video"],
+) -> frozenset[str]:
+    """Return the active model's accepted fields, including transport aliases."""
+
+    if api == "image":
+        return sampling_params_cls.image_request_extra_fields()
+    return sampling_params_cls.video_request_extra_fields()
+
+
+@cache
+def get_sampling_request_extra_fields(
+    sampling_params_cls: type[SamplingParams],
+    api: Literal["image", "video"],
+) -> frozenset[str]:
+    """Return declared extension fields that can initialize SamplingParams.
+
+    A video declaration may also contain transport-only aliases. Those remain
+    on the request for the model's lowering hook instead of being passed to the
+    dataclass constructor.
+    """
+
+    declared = get_declared_request_extra_fields(sampling_params_cls, api)
+    init_fields = {
+        field.name for field in dataclasses.fields(sampling_params_cls) if field.init
+    }
+    return declared & init_fields
+
+
+def request_model_kwargs(
+    request: BaseModel,
+    sampling_params_cls: type[SamplingParams],
+    api: Literal["image", "video"],
+) -> dict[str, Any]:
+    """Extract only constructor fields declared by the active model contract."""
+    kwargs = {}
+    for field_name in get_sampling_request_extra_fields(sampling_params_cls, api):
+        value = request_extra_value(request, field_name)
+        if value is not None:
+            kwargs[field_name] = value
+    return kwargs
+
+
+def parse_form_extra_value(value: Any) -> Any:
+    """Decode a multipart form value as JSON, keeping text that is not JSON."""
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except Exception:
+        return value
+
+
+def form_model_kwargs(
+    form: Any,
+    sampling_params_cls: type[SamplingParams],
+    api: Literal["image", "video"],
+) -> dict[str, Any]:
+    """Multipart counterpart of the JSON request path: the active model's
+    declared constructor fields sent as form fields."""
+    declared = (
+        sampling_params_cls.image_request_extra_fields()
+        if api == "image"
+        else sampling_params_cls.video_request_extra_fields()
+    )
+    init_fields = {
+        field.name for field in dataclasses.fields(sampling_params_cls) if field.init
+    }
+    kwargs = {}
+    for field_name in declared & init_fields:
+        if field_name in form:
+            value = parse_form_extra_value(form[field_name])
+            if value is not None:
+                kwargs[field_name] = value
+    return kwargs
+
+
 @contextmanager
 def temp_dir_if_disabled(
     configured_path: str | None,
@@ -135,6 +296,17 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
 
     # pop HTTP-layer params that aren't SamplingParams fields
     output_quality = kwargs.pop("output_quality", None)
+    request_data_type = kwargs.pop("request_data_type", None)
+    if request_data_type is not None:
+        try:
+            kwargs["task_type"] = server_args.pipeline_config.resolve_task_type(
+                kwargs.get("task_type"),
+                data_type=request_data_type,
+                has_image=bool(kwargs.get("image_path")),
+                has_video=bool(kwargs.get("video_path")),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     has_explicit_compression = kwargs.get("output_compression") is not None
 
