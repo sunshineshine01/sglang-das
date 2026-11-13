@@ -88,13 +88,18 @@ def get_exact_version_tag() -> str:
 
 
 def get_release_branch_version() -> str:
-    """Return a v{X.Y.Z}-0-g{hash} string when on a release_vX.Y.Z branch.
+    """Return X.Y.Z+g<hash> when on a release_vX.Y.Z branch.
 
     Fork release branches are named after the upstream release they carry
     (e.g., release_v0.5.18_MiniMax_H3_Image) but have no matching git tag
     in the fork. Pinning the base version to the branch name makes builds
     from a release branch report X.Y.Z+g<hash> instead of drifting with
     whichever fork tags happen to exist.
+
+    The commit id is embedded as a PEP 440 local version part (not a
+    `git describe` distance), so setuptools-scm keeps it verbatim; a
+    distance-0 describe string would be treated as an exact tag match
+    and the local part would be dropped.
     """
     branch = run_git("branch", "--show-current")
     m = re.match(r"^release_v(\d+\.\d+\.\d+)(?:[_.].*)?$", branch)
@@ -103,7 +108,7 @@ def get_release_branch_version() -> str:
     short_hash = run_git("rev-parse", "--short", "HEAD")
     if not short_hash:
         return ""
-    return f"v{m.group(1)}-0-g{short_hash}"
+    return f"{m.group(1)}+g{short_hash}"
 
 
 def get_latest_version_tag_describe() -> str:
