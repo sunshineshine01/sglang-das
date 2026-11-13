@@ -11,7 +11,6 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_hcu
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -65,10 +64,10 @@ def _can_use_fused_qknorm_rope(
     pack_kv: bool,
     cache_has_full_width: bool,
 ) -> bool:
-    # This JIT kernel emits CUDA source. Keep the existing unfused
-    # QK-Norm + RoPE implementation on HCU instead of attempting CUDA JIT.
-    if is_hcu():
-        return False
+    # The JIT toolchain dispatches to hipcc on ROCm/HCU and emits the same
+    # kernel source, so the fused path is no longer gated on the platform.
+    # The try-compile below remains the final fallback for any platform
+    # where the kernel cannot be built.
     if dtype not in _SUPPORTED_DTYPES or cache_dtype not in _SUPPORTED_CACHE_DTYPES:
         logger.warning(
             "Unsupported dtype pair (%s, %s) for JIT fused QKNorm+RoPE",
