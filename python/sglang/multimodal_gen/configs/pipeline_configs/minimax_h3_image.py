@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.srt.utils import is_hcu
 
 # The assembled image VAE (CNN encoder + 2D ViT decoder) is one standard
 # diffusers component weight file, unlike the video VAE's source/ layout.
@@ -42,6 +43,26 @@ def _dense_attention_backend() -> AttentionBackendEnum:
     if current_platform.is_rocm():
         return AttentionBackendEnum.AITER
     return AttentionBackendEnum.FA
+
+
+def _dense_attention_backends() -> tuple[AttentionBackendEnum, ...]:
+    """All dense packed-varlen FlashAttention backends usable on this platform.
+
+    On HCU the DTK ``flash_attn`` build additionally serves the FA family
+    (fa/fa2/fa3, normalized to FA/FA2) through FlashAttention2Backend's
+    varlen fallback, so those are also valid dense choices there.
+    """
+    backends = (_dense_attention_backend(),)
+    # Mirror the ROCm selector's routing condition (rocm.py: is_hcu() and
+    # flash_attn importable -> FlashAttention2Backend) so the whitelist only
+    # admits the FA family where the selector actually serves it.
+    if is_hcu():
+        try:
+            import flash_attn  # noqa: F401
+        except ImportError:
+            return backends
+        backends += (AttentionBackendEnum.FA, AttentionBackendEnum.FA2)
+    return backends
 
 
 @dataclass
@@ -231,7 +252,7 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
             raise ValueError("MiniMax H3 image requires the native SGLang backend")
         selected_backend = self.resolve_transformer_attention_backend(server_args)
         dense_backend = _dense_attention_backend()
-        if selected_backend not in (None, dense_backend):
+        if selected_backend not in (None, *_dense_attention_backends()):
             raise ValueError(
                 "MiniMax H3 image requires dense FlashAttention "
                 f"(--attention-backend {dense_backend.name.lower()} on this platform)"
@@ -311,11 +332,15 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
         if component_backend is None:
             # Request dense FA for the transformer through the generic explicit-request
             # path, so the loader refuses a transformer that does not run it.
-            # Explicit global/component/forced choices were checked above.
-            dense_backend = _dense_attention_backend().name.lower()
-            server_args.component_attention_backends["transformer"] = dense_backend
+            # Explicit global/component/forced choices were checked above, so honor
+            # the user's selection; default to the platform pick only when absent.
+            injected_backend = (
+                selected_backend if selected_backend is not None else dense_backend
+            )
+            backend_name = injected_backend.name.lower()
+            server_args.component_attention_backends["transformer"] = backend_name
             server_args._requested_component_attention_backends["transformer"] = (
-                dense_backend
+                backend_name
             )
 
     def _configure_online_adaln(self, server_args) -> None:
