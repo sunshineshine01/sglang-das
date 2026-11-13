@@ -346,7 +346,11 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV, kOutOfPl
           for (uint32_t j = 0; j < kVecSize; ++j) {
             auto partner_vec = output_vec[j];
             auto partner_bits = reinterpret_cast<const uint32_t&>(partner_vec);
-            partner_bits = __shfl_sync(kActiveMask, partner_bits, partner_lane);
+            // Pass the warp width explicitly: CUDA's default is 32 lanes, but on
+            // ROCm the mapped `__shfl` defaults to the full wavefront (64 lanes
+            // on gfx938), which would read the partner element from the
+            // previous logical warp.
+            partner_bits = __shfl_sync(kActiveMask, partner_bits, partner_lane, kWarpThreads);
             reinterpret_cast<uint32_t&>(partner_vec) = partner_bits;
             auto& values = unpack(output_vec[j]);
             const auto& partner_values = unpack(partner_vec);
@@ -399,10 +403,13 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV, kOutOfPl
 
 #pragma unroll
     for (uint32_t j = 0; j < kVecSize; ++j) {
-      const auto [x0, x1] = cast<fp32x2_t>(input_vec[j]);
-      elems[2 * j] = x0;
-      elems[2 * j + 1] = x1;
-      sum_of_squares += x0 * x0 + x1 * x1;
+      // HIP's `HIP_vector_type` stores members in an anonymous union, which
+      // cannot be decomposed via structured bindings; use `.x`/`.y` access
+      // instead (same pattern as `impl/norm.cuh`).
+      const auto x2 = cast<fp32x2_t>(input_vec[j]);
+      elems[2 * j] = x2.x;
+      elems[2 * j + 1] = x2.y;
+      sum_of_squares += x2.x * x2.x + x2.y * x2.y;
     }
 
     sum_of_squares = warp::reduce_sum(sum_of_squares);
@@ -410,9 +417,9 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV, kOutOfPl
 
 #pragma unroll
     for (uint32_t j = 0; j < kVecSize; ++j) {
-      const auto [w0, w1] = cast<fp32x2_t>(weight_vec[j]);
-      elems[2 * j] *= norm_factor * w0;
-      elems[2 * j + 1] *= norm_factor * w1;
+      const auto w2 = cast<fp32x2_t>(weight_vec[j]);
+      elems[2 * j] *= norm_factor * w2.x;
+      elems[2 * j + 1] *= norm_factor * w2.y;
     }
 
     if constexpr (kIsNeox) {
@@ -425,7 +432,7 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV, kOutOfPl
 
 #pragma unroll
         for (uint32_t i = 0; i < kElemsPerThread; ++i) {
-          float swapped = __shfl_sync(kActiveMask, elems[i], partner_lane);
+          float swapped = __shfl_sync(kActiveMask, elems[i], partner_lane, kWarpThreads);
           if (lane_id < kHalfRotaryLanes) {
             swapped = -swapped;
           }

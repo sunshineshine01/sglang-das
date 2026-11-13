@@ -1076,16 +1076,20 @@ class MiniMaxH3Attention(nn.Module):
         rope_dim = 6 * arch.rope_inv_freq_len
         # Not apply_qk_norm_rope: Q/K are [tokens, heads, head_dim] and the norms
         # are torch nn.RMSNorm, so the fused kernel is called directly.
+        # The JIT fused QKNorm+RoPE kernel compiles through the HIP toolchain
+        # as well, so allow ROCm/HCU in addition to CUDA. The
+        # can_use_fused_inplace_qknorm_rope guard still try-compiles the
+        # kernel and falls back to the separated path on failure.
         self._use_fused_qknorm_rope = (
             current_platform.is_cuda()
-            and can_use_fused_inplace_qknorm_rope(
-                arch.attention_head_dim,
-                rope_dim,
-                True,
-                _BF16_DTYPE,
-                cache_dtype=_BF16_DTYPE,
-                round_norm_before_rope=True,
-            )
+            or current_platform.is_hip()
+        ) and can_use_fused_inplace_qknorm_rope(
+            arch.attention_head_dim,
+            rope_dim,
+            True,
+            _BF16_DTYPE,
+            cache_dtype=_BF16_DTYPE,
+            round_norm_before_rope=True,
         )
         self.out_proj = RowParallelLinear(
             self.inner_dim,
