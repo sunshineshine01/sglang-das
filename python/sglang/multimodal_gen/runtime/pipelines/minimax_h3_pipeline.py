@@ -1,13 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import os
 import shutil
 from dataclasses import replace
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3_image import (
+    MiniMaxH3ImagePipelineConfig,
+)
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
+from sglang.multimodal_gen.configs.sample.minimax_h3_image import (
+    MiniMaxH3ImageSamplingParams,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -22,6 +30,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MiniMaxH3TextEncodingStage,
     MiniMaxH3TimestepPreparationStage,
     MiniMaxH3VisualEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.material_io import (
+    minimax_h3_cleanup_temp_dirs,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.reference_encoding import (
+    MINIMAX_H3_PREPARED_REFERENCE_IMAGE_EXTRA_KEY,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
     MiniMaxH3PartitionAdmissionStage,
@@ -115,6 +129,11 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             self.server_args.model_subfolder = semantic_subfolder
         model_index = super()._load_config()
         self.release_metadata = MiniMaxH3ReleaseMetadata.from_model_index(model_index)
+        if self.release_metadata.is_image == self.is_video_pipeline:
+            raise ValueError(
+                f"{self.pipeline_name} cannot serve the "
+                f"{self.release_metadata.partition!r} release partition"
+            )
         if (
             model_variant is not None
             and self.release_metadata.partition != semantic_subfolder.lower()
@@ -140,6 +159,27 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 f"disaggregation role {role.value!r} is not supported"
             )
 
+    def initialize_pipeline(self, server_args: ServerArgs) -> None:
+        self.pdd_heads = self._resolve_pdd_heads()
+        transformer = self.get_module("transformer")
+        final_layer = getattr(transformer, "final_layer", None)
+        if (
+            self.pdd_heads
+            and final_layer is not None
+            and getattr(final_layer, "_pdd_heads", None) is None
+        ):
+            final_layer.load_pdd_fused_heads(self.pdd_heads)
+
+    def _resolve_pdd_heads(self) -> str | None:
+        """The env override, else a PDD release's own fused heads."""
+        env_heads = getattr(envs, "SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS", None)
+        if env_heads:
+            return env_heads
+        release_metadata = getattr(self, "release_metadata", None)
+        if release_metadata is None or release_metadata.pdd_fused_heads is None:
+            return None
+        return os.path.join(self.model_path, release_metadata.pdd_fused_heads)
+
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         # Per-model sigma override from model_index.json; contract tests
         # construct the pipeline without model_path, hence the guard.
@@ -149,9 +189,27 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             if release_metadata is not None
             else None
         )
-        self.add_stage(InputValidationStage())
+        dit_arch = server_args.pipeline_config.dit_config.arch_config
+        if self.is_video_pipeline and not dit_arch.audio_enabled:
+            raise ValueError(
+                f"{self.pipeline_name} generates audio; its DiT checkpoint cannot "
+                "be audio-free (audio_enabled: false in transformer/config.json)"
+            )
+        if self.is_video_pipeline:
+            # Video only: image releases skip the generic image_path load/resize;
+            # Qwen and the VAE apply their own reference preprocessing.
+            self.add_stage(InputValidationStage())
         if release_metadata is not None:
             self.add_stage(MiniMaxH3PartitionAdmissionStage(release_metadata))
+        text_encoder = self.get_module("text_encoder")
+        visual = getattr(getattr(text_encoder, "model", None), "visual", None)
+        if not self.is_video_pipeline and visual is not None:
+            # CPU initialization computes pow differently from CUDA. Image
+            # releases rebuild the small vision frequency table after offload
+            # transfers so conditioning matches the GPU-resident encoder, as in
+            # the native Qwen-Image path. Video releases keep the table their
+            # consistency references were generated with.
+            visual.rotary_pos_emb.recompute_on_device_change = True
         self.add_stage(
             MiniMaxH3TextEncodingStage(
                 text_encoder=self.get_module("text_encoder"),
@@ -165,12 +223,13 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 vae_arch_config=server_args.pipeline_config.vae_config.arch_config,
             )
         )
-        self.add_stage(
-            MiniMaxH3AudioEncodingStage(
-                audio_vae=self.get_module("audio_vae"),
-                vae_arch_config=server_args.pipeline_config.audio_vae_config.arch_config,
+        if self.is_video_pipeline:
+            self.add_stage(
+                MiniMaxH3AudioEncodingStage(
+                    audio_vae=self.get_module("audio_vae"),
+                    vae_arch_config=server_args.pipeline_config.audio_vae_config.arch_config,
+                )
             )
-        )
         self.add_stage(MiniMaxH3LatentPreparationStage())
         self.add_stage(
             MiniMaxH3TimestepPreparationStage(
@@ -180,6 +239,7 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                     if release_metadata is not None
                     else None
                 ),
+                pdd_heads=getattr(self, "pdd_heads", None),
             )
         )
         self.add_stage(
@@ -218,4 +278,43 @@ class FastH3Pipeline(MiniMaxH3Pipeline):
     default_model_subfolder = None
 
 
-EntryClass = [MiniMaxH3Pipeline, FastH3Pipeline]
+class MiniMaxH3ImagePipeline(MiniMaxH3Pipeline):
+    """One image checkpoint for its declared t2i/edit tasks: H3 stages without audio."""
+
+    pipeline_name = "MiniMaxH3ImagePipeline"
+    default_model_subfolder = None
+    is_video_pipeline = False
+    pipeline_config_cls = MiniMaxH3ImagePipelineConfig
+    sampling_params_cls = MiniMaxH3ImageSamplingParams
+    _required_config_modules = [
+        "processor",
+        "text_encoder",
+        "tokenizer",
+        "video_vae",
+        "transformer",
+    ]
+    # The image release names its one VAE `vae` (model_index.json key and
+    # directory), as diffusers does; the shared H3 stages call the module
+    # `video_vae`, so the pipeline loads that module from `vae/`.
+    _extra_config_module_map = {"video_vae": "vae"}
+
+    def initialize_pipeline(self, server_args: ServerArgs) -> None:
+        # Image releases are PDD checkpoints; there is no image sampler for a
+        # checkpoint without its fused per-step output heads.
+        if self._resolve_pdd_heads() is None:
+            raise ValueError(
+                f"{self.pipeline_name} serves PDD releases only: model_index.json "
+                "must name the fused heads in _minimax_h3.pdd_fused_heads"
+            )
+        super().initialize_pipeline(server_args)
+
+    def forward(self, batch, server_args):
+        try:
+            return super().forward(batch, server_args)
+        finally:
+            # Never retain request images or downloaded references.
+            batch.extra.pop(MINIMAX_H3_PREPARED_REFERENCE_IMAGE_EXTRA_KEY, None)
+            minimax_h3_cleanup_temp_dirs(batch)
+
+
+EntryClass = [MiniMaxH3Pipeline, FastH3Pipeline, MiniMaxH3ImagePipeline]

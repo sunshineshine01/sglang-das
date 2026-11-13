@@ -41,6 +41,8 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     add_common_data_to_response,
     build_sampling_params,
     choose_output_image_ext,
+    flatten_extra_params,
+    form_model_kwargs,
     merge_image_input_list,
     process_generation_batch,
     request_extra_value,
@@ -433,6 +435,9 @@ async def edits(
     server_args = get_global_server_args()
     sampling_params_cls = resolve_sampling_params_cls(server_args)
     output_format = _resolve_image_output_format(output_format, sampling_params_cls)
+    model_kwargs = form_model_kwargs(
+        await raw_request.form(), sampling_params_cls, "image"
+    )
     # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
     images = image or image_array
     urls = url or url_array
@@ -506,6 +511,7 @@ async def edits(
             profile=profile,
             num_profiled_timesteps=num_profiled_timesteps,
             profile_all_stages=profile_all_stages,
+            **model_kwargs,
         )
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(

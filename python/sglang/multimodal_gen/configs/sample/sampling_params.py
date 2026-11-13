@@ -97,7 +97,6 @@ def validate_frame_interpolation_exp(exp: int) -> None:
             f"got {exp!r}"
         )
 
-
 @dataclass(frozen=True)
 class SkipSoftmaxParams:
     """Validated request-scoped BLASST/Skip-Softmax controls."""
@@ -163,7 +162,6 @@ def normalize_quality(quality: str) -> str:
 def quality_allows(quality: str, tier: str) -> bool:
     """Whether a request at ``quality`` may run a fast path of class ``tier``."""
     return QUALITY_LEVELS.index(quality) >= QUALITY_LEVELS.index(tier)
-
 
 def _sanitize_filename(name: str, replacement: str = "_", max_length: int = 150) -> str:
     """Create a filesystem- and ffmpeg-friendly filename.
@@ -237,7 +235,6 @@ def align_num_frames_for_num_gpus(
         return (new_latent_num_frames - 1) * temporal_scale_factor + 1
     return new_latent_num_frames
 
-
 @dataclass
 class SamplingParams:
     """
@@ -287,6 +284,7 @@ class SamplingParams:
     output_compression: int | None = None
     # MP4 encode speed; None keeps the server's default preset
     x264_preset: str | None = None
+
     # Model-owned, request-scoped quality level (see QUALITY_LEVELS).
     #
     # - "exact": the reference path, plus the fast paths that reproduce its
@@ -435,6 +433,8 @@ class SamplingParams:
     adjust_frames: bool = True
     # if True, suppress verbose logging for this request
     suppress_logs: bool = field(default=False, metadata={"batch_sig_exclude": True})
+    # requested task type; None resolves from the pipeline config
+    task_type: ModelTaskType | str | None = None
 
     # return output file paths directly to client
     return_file_paths_only: bool = True
@@ -545,7 +545,6 @@ class SamplingParams:
         endpoint resolves the active subclass before reading these fields, so
         model-specific extraction and defaults stay out of the API layer.
         """
-
         return frozenset()
 
     @classmethod
@@ -1329,8 +1328,7 @@ class SamplingParams:
                 "bit-identical output in the same environment; 'high' may "
                 "also enable model-owned approximate paths. 'extra-high' is "
                 "accepted as the former name of 'lossless'. Support and "
-                "validated deployment constraints are model-specific."
-            ),
+                "validated deployment constraints are model-specific."            ),
         )
         add_argument(
             "--num-outputs-per-prompt",

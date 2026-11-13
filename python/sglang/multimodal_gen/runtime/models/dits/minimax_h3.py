@@ -211,6 +211,8 @@ _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER = (
     "final_layer.audio_out.bias",
 )
 MINIMAX_H3_FP32_PARAM_NAMES = frozenset(_MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER)
+# The modules an audio-free checkpoint (``audio_enabled: false``) omits.
+_MINIMAX_H3_AUDIO_MODULES = ("audio_patch_proj", "final_layer.audio_out")
 MINIMAX_H3_FP32_BUFFER_NAMES = frozenset({"rope.inv_freq"})
 
 
@@ -1824,6 +1826,15 @@ class MiniMaxH3DiTBlock(nn.Module):
         )
 
 
+def _fp32_param_names_in_model_order(arch: MiniMaxH3DiTArchConfig) -> list[str]:
+    """The fp32 parameters in model order; audio-free checkpoints omit audio ones."""
+    return [
+        name
+        for name in _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER
+        if arch.audio_enabled or name.rsplit(".", 1)[0] not in _MINIMAX_H3_AUDIO_MODULES
+    ]
+
+
 class MiniMaxH3FinalLayer(nn.Module):
     def __init__(
         self,
@@ -1863,34 +1874,53 @@ class MiniMaxH3FinalLayer(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.video_out",
         )
-        self.audio_out = ColumnParallelLinear(
-            arch.hidden_size,
-            arch.audio_latents_dim,
-            bias=True,
-            gather_output=False,
-            params_dtype=_FP32_DTYPE,
-            quant_config=None,
-            prefix=f"{prefix}.audio_out",
+        # An audio-free checkpoint has no audio head; `_project` returns
+        # zero-width audio rows.
+        self.audio_out = (
+            ColumnParallelLinear(
+                arch.hidden_size,
+                arch.audio_latents_dim,
+                bias=True,
+                gather_output=False,
+                params_dtype=_FP32_DTYPE,
+                quant_config=None,
+                prefix=f"{prefix}.audio_out",
+            )
+            if arch.audio_enabled
+            else None
         )
         # Parallel Decoding Distillation heads, one per denoise step, loaded by
         # `load_pdd_fused_heads`. None on every ordinary run.
-        self._pdd_heads: dict[str, torch.Tensor] | None = None
+        # Parallel Decoding Distillation heads, one per denoise step, loaded by
+        # `load_pdd_fused_heads`. None on every ordinary run.
+        self._pdd_heads: dict | None = None
+        self._pdd_device_heads: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def load_pdd_fused_heads(self, path: str) -> None:
-        """Swap the two output heads for a per-step stack (PDD).
+        """Swap the output heads for a per-step stack (PDD).
 
         PDD replicates the final linear layer once per time interval and lets one
         backbone evaluation advance a whole block of them; the per-block heads
         fuse into one because H3's euler-eta0 step is linear in the predicted
         velocity. `tools/fuse_minimax_h3_pdd_heads.py` does that fusion offline,
-        leaving one head per denoise step.
+        leaving one head per denoise step. An audio-free model takes only
+        ``video_out.{weight,bias}``.
         """
         from safetensors import safe_open
 
         with safe_open(path, "pt") as f:
             heads = {k: f.get_tensor(k) for k in f.keys()}
+        names = ("video_out",) if self.audio_out is None else ("video_out", "audio_out")
+        expected = {
+            f"{name}.{suffix}" for name in names for suffix in ("weight", "bias")
+        }
+        if set(heads) != expected:
+            raise ValueError(
+                f"MiniMax-H3 PDD heads must hold exactly {sorted(expected)}, "
+                f"got {sorted(heads)}"
+            )
         steps = heads["video_out.weight"].shape[0]
-        for name in ("video_out", "audio_out"):
+        for name in names:
             projection = getattr(self, name)
             for suffix, shape in (
                 ("weight", (steps, projection.output_size, projection.input_size)),
@@ -1902,9 +1932,20 @@ class MiniMaxH3FinalLayer(nn.Module):
                 width = projection.output_size_per_partition
                 heads[key] = heads[key].narrow(1, projection.tp_rank * width, width)
         self._pdd_heads = heads
+        self._pdd_device_heads = {}
         logger.info("MiniMax-H3 PDD: %d fused output heads loaded from %s", steps, path)
 
-    def _pdd_project(self, h: torch.Tensor, name: str) -> torch.Tensor:
+    def _new_pdd_output(self, h: torch.Tensor, name: str) -> torch.Tensor:
+        out_features = self._pdd_heads[f"{name}.weight"].shape[1]
+        return h.new_empty((*h.shape[:-1], out_features))
+
+    # The PDD head follows the live denoising step in forward context. The
+    # vendored eager_on_graph has no output_factory/pass_output replay support,
+    # so the decorator only marks the graph break point here.
+    @eager_on_graph(True)
+    def _pdd_project(
+        self, h: torch.Tensor, name: str, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         heads = self._pdd_heads
         step = int(get_forward_context().current_timestep)
         stack = heads[f"{name}.weight"]
@@ -1914,14 +1955,28 @@ class MiniMaxH3FinalLayer(nn.Module):
                 f"step {step}; run with --num-inference-steps {stack.shape[0]} "
                 "(num_inference_steps counts denoise transitions)."
             )
-        weight = stack[step].to(device=h.device, dtype=h.dtype)
-        bias = heads[f"{name}.bias"][step].to(device=h.device, dtype=h.dtype)
-        return torch.nn.functional.linear(h, weight, bias)
+        key = (name, h.device, h.dtype)
+        if key not in self._pdd_device_heads:
+            self._pdd_device_heads[key] = (
+                stack.to(device=h.device, dtype=h.dtype),
+                heads[f"{name}.bias"].to(device=h.device, dtype=h.dtype),
+            )
+        weight, bias = self._pdd_device_heads[key]
+        result = torch.nn.functional.linear(h, weight[step], bias[step])
+        if out is None:
+            return result
+        out.copy_(result)
+        return out
 
     def _project(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self._pdd_heads is not None:
-            return self._pdd_project(h, "video_out"), self._pdd_project(h, "audio_out")
-        video, _ = self.video_out(h)
+            video = self._pdd_project(h, "video_out")
+        else:
+            video, _ = self.video_out(h)
+        if self.audio_out is None:
+            return video, h.new_empty((h.shape[0], 0))
+        if self._pdd_heads is not None:
+            return video, self._pdd_project(h, "audio_out")
         audio, _ = self.audio_out(h)
         return video, audio
 
@@ -2208,7 +2263,11 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             ("adaln_out_features", arch.adaln_out_features),
             ("final_adaln_out_features", arch.final_adaln_out_features),
             ("video_patch_output_dim", arch.latents_dim * math.prod(arch.patch_size)),
-            ("audio_patch_output_dim", arch.audio_latents_dim),
+            *(
+                (("audio_patch_output_dim", arch.audio_latents_dim),)
+                if arch.audio_enabled
+                else ()
+            ),
         ):
             if value % tp_size:
                 raise ValueError(
@@ -2265,10 +2324,17 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         super().__init__(config=config, hf_config=hf_config)
         arch = self.config
         if (
-            adaln_cache_path is not None or adaln_weight_files is not None
-        ) and quant_config is not None:
+            (adaln_cache_path is not None or adaln_weight_files is not None)
+            and quant_config is not None
+            and not (
+                adaln_cache_path is None
+                and quant_config.get_name() in ("fp8", "mxfp8")
+                and not getattr(quant_config, "is_checkpoint_fp8_serialized", True)
+            )
+        ):
             raise ValueError(
-                "MiniMax H3 AdaLN cache is only compatible with unquantized weights"
+                "MiniMax H3 AdaLN cache requires unquantized weights or online "
+                "FP8 with AdaLN rebuilt from native checkpoint weights"
             )
         if arch.adaln_curve_grid is not None and (
             adaln_cache_path is not None or adaln_weight_files is not None
@@ -2307,14 +2373,18 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             quant_config=None,
             prefix="video_patch_proj",
         )
-        self.audio_patch_proj = ColumnParallelLinear(
-            arch.audio_latents_dim,
-            arch.hidden_size,
-            bias=True,
-            gather_output=True,
-            params_dtype=_FP32_DTYPE,
-            quant_config=None,
-            prefix="audio_patch_proj",
+        self.audio_patch_proj = (
+            ColumnParallelLinear(
+                arch.audio_latents_dim,
+                arch.hidden_size,
+                bias=True,
+                gather_output=True,
+                params_dtype=_FP32_DTYPE,
+                quant_config=None,
+                prefix="audio_patch_proj",
+            )
+            if arch.audio_enabled
+            else None
         )
         self.condition_proj = ColumnParallelLinear(
             arch.text_dim,
@@ -2546,7 +2616,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                 param.missing_param_init = "error"
 
     def post_load_weights(self) -> None:
-        fp32_param_names = list(_MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER)
+        fp32_param_names = _fp32_param_names_in_model_order(self.arch)
         if self.adaln_t_table is not None:
             fp32_param_names = [
                 name
@@ -2895,6 +2965,11 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         audio_pos = self._pos_ids(
             _required_kwarg(kwargs, "audio_pos_info"), "audio_pos_info"
         )
+        if not self.arch.audio_enabled and audio_pos.numel():
+            raise ValueError(
+                "this MiniMax H3 checkpoint is audio-free (audio_enabled: false) "
+                f"but the request packs {audio_pos.numel()} audio rows"
+            )
         text_pos = self._pos_ids(
             _required_kwarg(kwargs, "text_pos_info"),
             "text_pos_info",
@@ -2993,7 +3068,12 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                 ),
             )
             self.release_mps_non_layer_weights("rope")
-        self.materialize_mps_non_layer_weights(*_MPS_EMBED_WEIGHT_PREFIXES)
+        embed_weight_prefixes = _MPS_EMBED_WEIGHT_PREFIXES
+        if not self.arch.audio_enabled:
+            embed_weight_prefixes = tuple(
+                p for p in embed_weight_prefixes if p != "audio_patch_proj"
+            )
+        self.materialize_mps_non_layer_weights(*embed_weight_prefixes)
         img_pos = img_pos.to(device)
         audio_pos = audio_pos.to(device)
         text_pos = text_pos.to(device)
@@ -3014,7 +3094,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             refined_prompt_embeds_length=kwargs.get("refined_prompt_embeds_length"),
             local_embedding_layout=kwargs.get("local_embedding_layout"),
         )
-        self.release_mps_non_layer_weights(*_MPS_EMBED_WEIGHT_PREFIXES)
+        self.release_mps_non_layer_weights(*embed_weight_prefixes)
         # request-step AdaLN input shared by all blocks
         adaln_input = (
             t_emb
@@ -3154,10 +3234,15 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         # rows have been removed. For hybrid TP+Ulysses, the preceding SP row
         # gather also carries only the TP-local output width.
         video_logits = video_logits.index_select(0, infer_out_pos.to(device))
-        audio_logits = audio_logits.index_select(0, audio_pos.to(device))
+        if self.arch.audio_enabled:
+            audio_logits = audio_logits.index_select(0, audio_pos.to(device))
+        else:
+            # No audio rows (checked above) and no audio head.
+            audio_logits = video_logits.new_empty((0, self.arch.audio_latents_dim))
         if get_tp_world_size() > 1:
             video_logits = tensor_model_parallel_all_gather(video_logits)
-            audio_logits = tensor_model_parallel_all_gather(audio_logits)
+            if self.arch.audio_enabled:
+                audio_logits = tensor_model_parallel_all_gather(audio_logits)
         if not skip_mask_out_condition:
             update_mask = update_mask.view(-1).to(device)
             if update_mask.shape[0] != video_logits.shape[0]:

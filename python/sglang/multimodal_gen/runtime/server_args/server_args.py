@@ -122,6 +122,44 @@ def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
     return mode.lower()
 
 
+def _infer_direct_constructor_explicit_arg_names(server_args) -> set[str]:
+    explicit_arg_names: set[str] = set()
+    for attr in dataclasses.fields(server_args):
+        if not attr.init or attr.name == "_explicit_arg_names":
+            continue
+
+        value = getattr(server_args, attr.name)
+        if attr.default is not dataclasses.MISSING:
+            default = attr.default
+        elif attr.default_factory is not dataclasses.MISSING:
+            default = attr.default_factory()
+        else:
+            explicit_arg_names.add(attr.name)
+            continue
+
+        if value != default:
+            explicit_arg_names.add(attr.name)
+
+    return explicit_arg_names
+
+
+def _normalize_component_precisions(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ValueError("component_precisions must be a mapping")
+
+    normalized: dict[str, str] = {}
+    for component, precision in value.items():
+        component_name = str(component).strip().replace("-", "_")
+        precision_name = str(precision).strip().lower()
+        if not component_name or precision_name not in PRECISION_TO_TYPE:
+            raise ValueError(
+                "Component precision entries require a component and one of "
+                f"{sorted(PRECISION_TO_TYPE)}"
+            )
+        normalized[component_name] = precision_name
+    return normalized
+
+
 def is_ltx2_two_stage_pipeline_name(pipeline_class_name: str | None) -> bool:
     return pipeline_class_name in LTX2_TWO_STAGE_PIPELINE_NAMES
 
@@ -229,11 +267,13 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "ltx-2",
         "ltx-2.3",
         "minimax-h3",
+        "minimax-h3-image",
         "minimaxai/minimax-h3",
         "inclusionai/ming-image-0.1-design",
         "inclusionai/ming-image-0.1-design-layer",
         "ming-image-0.1-design",
         "ming-image-0.1-design-layer",
+        "minimaxai/minimax-h3-image",
         "qwen/qwen-image",
         "qwen/qwen-image-2512",
         "qwen/qwen-image-2.1",
@@ -267,6 +307,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "MiniMaxH3PipelineConfig",
         "MingImagePipelineConfig",
         "MingImageLayerPipelineConfig",
+        "MiniMaxH3ImagePipelineConfig",
         "QwenImagePipelineConfig",
         "QwenImage21PipelineConfig",
         "SanaPipelineConfig",
@@ -324,6 +365,8 @@ class ServerArgs(DisaggServerArgsMixin):
     component_attention_backends: dict[str, str] | str | None = field(
         default_factory=dict
     )
+    # Snapshot of what the user explicitly asked for, taken before automatic
+    # adjustments add entries of their own (compare=False: derived state).
     _requested_component_attention_backends: dict[str, str] | None = field(
         default=None, repr=False, compare=False
     )
@@ -431,16 +474,13 @@ class ServerArgs(DisaggServerArgsMixin):
     transformer_weights_path: str | None = None
     # path to precomputed MiniMax H3 AdaLN outputs for inference-only serving.
     minimax_h3_adaln_cache_path: str | None = None
-    # Rebuild AdaLN outputs per request from the checkpoint, no sidecar needed.
-    minimax_h3_adaln_online: bool = False
-    # Widest timestep plan the rebuild slab is sized for; see
-    # MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
-    minimax_h3_adaln_plan_width: int = 4
-    # Pinned-host cache for built AdaLN plans (decimal GB, 0 disables). Plans
-    # evicted from the GPU slab swap back in from here instead of re-reading
-    # the 24.2 GiB checkpoint. Expert knobs (GPU slot count, fp32 rebuild)
-    # live in envs.py as SGLANG_DIFFUSION_MINIMAX_H3_ADALN_*.
-    minimax_h3_adaln_host_cache_gb: float = 8.0
+    # None lets the model choose; False explicitly keeps resident projections.
+    minimax_h3_adaln_online: bool | None = None
+    # None chooses 2 for image releases, otherwise MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
+    minimax_h3_adaln_plan_width: int | None = None
+    # Pinned-host cache for built AdaLN plans (decimal GB, 0 disables); None
+    # lets the model choose. Image releases set it to 0.
+    minimax_h3_adaln_host_cache_gb: float | None = None
     # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
     # When set, the transformer loader uses it instead of auto-detection.
     quantization: str | None = None
@@ -1453,6 +1493,16 @@ class ServerArgs(DisaggServerArgsMixin):
             fallback_keys.append(key[:-2])
         return fallback_keys
 
+    def requested_component_attention_backend(
+        self, component_name: str
+    ) -> str | None:
+        """What the user explicitly requested for a component, if anything."""
+        assert self._requested_component_attention_backends is not None
+        return self._requested_component_attention_backends.get(component_name)
+
+    def has_requested_component_attention_backends(self) -> bool:
+        return bool(self._requested_component_attention_backends)
+
     def resolve_component_attention_backend(
         self, *component_names: str | None
     ) -> tuple[AttentionBackendEnum | None, str | None]:
@@ -2241,7 +2291,7 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.minimax_h3_adaln_plan_width,
             help=(
                 "Widest timestep plan --minimax-h3-adaln-online sizes its slab "
-                "for. The default 4 covers every task; a deployment serving "
+                "for. By default 2 for image releases, otherwise 4 which covers every task; a deployment serving "
                 "only t2va (2) or fl2va (3) can shrink the slab proportionally. "
                 "A request exceeding it is rejected rather than truncated."
             ),

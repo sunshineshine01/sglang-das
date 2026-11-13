@@ -21,8 +21,10 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_world_group,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_encoder_call
 from sglang.multimodal_gen.runtime.distributed.group_coordinator import GroupCoordinator
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    model_parallel_is_initialized,
     use_tensor_parallel_group,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (

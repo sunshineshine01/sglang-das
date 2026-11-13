@@ -482,6 +482,8 @@ class OutputBatch:
     # Decoded LiDAR of a joint camera/LiDAR request: file paths and metadata,
     # plus range_m/intensity/validity arrays when the client asked for frames.
     lidar: dict[str, Any] | None = None
+    # encoded image per output when the request sets return_image_bytes
+    output_image_bytes: list[bytes | None] | None = None
 
     # logged metrics info, directly from Req.timings
     metrics: Optional[RequestMetrics] = None
@@ -501,5 +503,6 @@ class OutputBatch:
         self.trajectory_decoded = None
         self.output_file_paths = None
         self.lidar = None
+        self.output_image_bytes = None
         self.raw_frame_batches = None
         self.noise_pred = None
