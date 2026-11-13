@@ -8,7 +8,10 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "sglang-kernel"
-version = "0.4.6.post1"
+# Version is computed at build time by setup_hip.py as "0.4.6+g<commit>".
+# Marking it dynamic lets the setuptools-based AOT install (setup_hip.py)
+# supply the version; [project] static values would override setup().
+dynamic = ["version"]
 authors = [
   { name="SGLang Kernel Team", email="sglang@lmsys.org" },
 ]

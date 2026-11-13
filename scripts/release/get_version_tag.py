@@ -87,6 +87,25 @@ def get_exact_version_tag() -> str:
     )
 
 
+def get_release_branch_version() -> str:
+    """Return a v{X.Y.Z}-0-g{hash} string when on a release_vX.Y.Z branch.
+
+    Fork release branches are named after the upstream release they carry
+    (e.g., release_v0.5.18_MiniMax_H3_Image) but have no matching git tag
+    in the fork. Pinning the base version to the branch name makes builds
+    from a release branch report X.Y.Z+g<hash> instead of drifting with
+    whichever fork tags happen to exist.
+    """
+    branch = run_git("branch", "--show-current")
+    m = re.match(r"^release_v(\d+\.\d+\.\d+)(?:[_.].*)?$", branch)
+    if not m:
+        return ""
+    short_hash = run_git("rev-parse", "--short", "HEAD")
+    if not short_hash:
+        return ""
+    return f"v{m.group(1)}-0-g{short_hash}"
+
+
 def get_latest_version_tag_describe() -> str:
     """Find the highest version tag and build a describe string relative to it.
 
@@ -131,6 +150,11 @@ def get_version_describe() -> str:
     exact = get_exact_version_tag()
     if exact:
         return exact
+
+    # Release branch: pin base version to the branch name
+    release = get_release_branch_version()
+    if release:
+        return release
 
     # Fallback for untagged commits (e.g., dev install from main)
     return get_latest_version_tag_describe()

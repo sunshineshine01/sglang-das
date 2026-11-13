@@ -15,6 +15,7 @@
 
 import os
 import platform
+import subprocess
 import sys
 from pathlib import Path
 
@@ -26,11 +27,24 @@ root = Path(__file__).parent.resolve()
 arch = platform.machine().lower()
 
 
+KERNEL_BASE_VERSION = "0.4.6"
+
+
 def _get_version():
-    with open(root / "pyproject.toml") as f:
-        for line in f:
-            if line.startswith("version"):
-                return line.split("=")[1].strip().strip('"')
+    """Build version as KERNEL_BASE_VERSION + g<short commit hash>.
+
+    Falls back to the bare base version when git is unavailable.
+    """
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(root),
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        return f"{KERNEL_BASE_VERSION}+g{commit}"
+    except Exception:
+        return KERNEL_BASE_VERSION
 
 
 operator_namespace = "sgl_kernel"
