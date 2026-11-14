@@ -23,8 +23,11 @@ from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding_,
 )
 from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
     can_use_fused_inplace_qknorm_rope,
+    can_use_fused_rmsnorm_indexed_scale_shift,
     fused_inplace_qknorm_rope,
+    fused_rmsnorm_indexed_scale_shift,
     indexed_gate_bf16,
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
@@ -359,6 +362,95 @@ def _modulate_scale_shift(
     return (
         x * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)
     ).to(dtype)
+
+
+_RMSNORM_MODULATE_GATE = BitExactFusionGate("MiniMax-H3 fused RMSNorm + modulate")
+
+# First-sight path diagnostics: the bit-exact gate falls back silently by
+# design, so record why the fused path was (not) taken once per reason.
+_RMSNORM_MODULATE_DIAG_SEEN: set[str] = set()
+
+
+def _rmsnorm_modulate_diag(event: str, **fields: Any) -> None:
+    if event in _RMSNORM_MODULATE_DIAG_SEEN:
+        return
+    _RMSNORM_MODULATE_DIAG_SEEN.add(event)
+    logger.warning(
+        "MiniMax-H3 RMSNorm+modulate fast path: %s %s", event, fields
+    )
+
+
+def _rmsnorm_modulate_scale_shift(
+    norm: nn.Module,
+    x: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    fused_fp32: bool = False,
+) -> torch.Tensor:
+    """``_modulate_scale_shift(norm(x), ...)`` with a bit-exact fused path.
+
+    On HCU this replaces the ``aten vectorized_layer_norm`` +
+    ``indexed_scale_shift_bf16_`` pair with one Triton kernel that reproduces
+    the eager chain bit for bit (~1.8x); falls back to the eager chain on
+    any other platform/layout or on the first mismatch.
+    """
+    gate = _RMSNORM_MODULATE_GATE
+    weight = getattr(norm, "weight", None)
+    if (
+        not fused_fp32
+        and dtype == _BF16_DTYPE
+        and weight is not None
+        and gate.can_attempt_once()
+        and can_use_fused_rmsnorm_indexed_scale_shift(
+            x, weight, shift, scale, indices
+        )
+    ):
+        try:
+            out = fused_rmsnorm_indexed_scale_shift(
+                x, weight, shift, scale, indices, norm.eps
+            )
+            if not gate.is_verified():
+                ref = indexed_scale_shift_bf16_(
+                    norm(x), shift, scale, indices
+                )
+                out = gate.accept_or_fallback(out, ref)
+                _rmsnorm_modulate_diag(
+                    "verified" if gate.is_verified() else "mismatch",
+                    x_shape=tuple(x.shape),
+                    x_dtype=str(x.dtype),
+                    x_contiguous=bool(x.is_contiguous()),
+                )
+            return out
+        except Exception as e:  # noqa: BLE001
+            gate.on_exception(e, logger=logger)
+    elif "fallback" not in _RMSNORM_MODULATE_DIAG_SEEN:
+        _rmsnorm_modulate_diag(
+            "fallback",
+            fused_fp32=fused_fp32,
+            dtype=str(dtype),
+            has_weight=weight is not None,
+            gate_attemptable=gate.can_attempt_once(),
+            guard_usable=(
+                can_use_fused_rmsnorm_indexed_scale_shift(
+                    x, weight, shift, scale, indices
+                )
+                if weight is not None
+                else None
+            ),
+            x_shape=tuple(x.shape),
+            x_dtype=str(x.dtype),
+            x_contiguous=bool(x.is_contiguous()),
+            x_stride=x.stride(),
+            shift_shape=tuple(shift.shape),
+            shift_stride=shift.stride(),
+            indices=tuple(indices.shape),
+        )
+    return _modulate_scale_shift(
+        norm(x), shift, scale, indices, dtype=dtype, fused_fp32=fused_fp32
+    )
 
 
 def _modulate_gate(
@@ -1564,9 +1656,9 @@ class MiniMaxH3DiTBlock(nn.Module):
         # first gated residual writes to that tensor; the second one operates on
         # a block-local buffer.
         residual = x
-        h = self.norm1(x)
-        h = _modulate_scale_shift(
-            h,
+        h = _rmsnorm_modulate_scale_shift(
+            self.norm1,
+            x,
             shift_msa,
             scale_msa,
             combined_indices,
@@ -1593,9 +1685,9 @@ class MiniMaxH3DiTBlock(nn.Module):
         )
 
         residual = x
-        h = self.norm2(x)
-        h = _modulate_scale_shift(
-            h,
+        h = _rmsnorm_modulate_scale_shift(
+            self.norm2,
+            x,
             shift_mlp,
             scale_mlp,
             combined_indices,
@@ -1818,9 +1910,9 @@ class MiniMaxH3FinalLayer(nn.Module):
                 torch.mps.empty_cache()
             assert video is not None and audio is not None
             return video, audio
-        h = self.norm(x)
-        h = _modulate_scale_shift(
-            h,
+        h = _rmsnorm_modulate_scale_shift(
+            self.norm,
+            x,
             shift,
             scale,
             inverse_indices,

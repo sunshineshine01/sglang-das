@@ -89,6 +89,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Bit-exact residual-gate add + RMSNorm + scale/shift.",
     ),
     (
+        "diffusion.rmsnorm_indexed_scale_shift",
+        KernelBackend.TRITON,
+        "norm.rmsnorm_indexed_modulate_triton:fused_rmsnorm_indexed_scale_shift",
+        _HIP,
+        "Bit-exact RMSNorm + indexed adaLN scale/shift (wave64 aten geometry).",
+    ),
+    (
         "diffusion.scale_residual_norm_scale_shift",
         KernelBackend.CUTE_DSL,
         "norm.scale_residual_norm_cutedsl:fused_scale_residual_norm_scale_shift",
@@ -371,6 +378,8 @@ _EXPORTS: dict[str, str] = {
     "can_use_fused_scale_residual_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
     "fused_rmsnorm_scale_shift_bitexact": "norm.rmsnorm_scale_shift_bitexact",
     "fused_scale_residual_rmsnorm_scale_shift_bitexact": "norm.rmsnorm_scale_shift_bitexact",
+    "can_use_fused_rmsnorm_indexed_scale_shift": "norm.rmsnorm_indexed_modulate_triton",
+    "fused_rmsnorm_indexed_scale_shift": "norm.rmsnorm_indexed_modulate_triton",
     "fused_norm_scale_shift": "norm.scale_residual_norm_cutedsl",
     "fused_scale_residual_norm_scale_shift": "norm.scale_residual_norm_cutedsl",
     "validate_scale_shift": "norm.scale_residual_norm_cutedsl",
