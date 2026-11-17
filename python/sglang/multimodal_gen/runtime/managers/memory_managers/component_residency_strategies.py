@@ -123,6 +123,28 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
     def __init__(self) -> None:
         self._prefetch_stream: object | None = None
         self._ready_events: dict[str, object] = {}
+        # Persistent pinned host copies of parameters, keyed by component name.
+        # Weights are read-only at inference time, so offload just rebinds
+        # params to these copies instead of doing a full D2H transfer.
+        self._host_params: dict[str, list[tuple[nn.Parameter, torch.Tensor]]] = {}
+
+    def _cache_host_params(self, module: nn.Module, name: str) -> None:
+        if name in self._host_params:
+            return
+        tensor = _module_reference_tensor(module)
+        if tensor is None or tensor.device.type != "cpu":
+            return
+        cached = []
+        for param in module.parameters():
+            data = param.data
+            if not data.is_pinned():
+                try:
+                    data = data.pin_memory()
+                except RuntimeError:
+                    pass  # fall back to pageable host copy
+                param.data = data
+            cached.append((param, data))
+        self._host_params[name] = cached
 
     def prepare_for_use(
         self,
@@ -130,6 +152,7 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
         use: ComponentUse,
         state: ResidencyState,
     ) -> None:
+        self._cache_host_params(module, use.component_name)
         _module_to_local_device(module, dtype=use.target_dtype)
 
     def wait_for_use(
@@ -154,6 +177,7 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
             return True
         if _module_ready_on_local_device(module, dtype=use.target_dtype):
             return True
+        self._cache_host_params(module, use.component_name)
         if self._prefetch_stream is None:
             self._prefetch_stream = torch.get_device_module().Stream(
                 device=get_local_torch_device()
@@ -174,7 +198,15 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
         self.wait_for_use(module, use, state)
         tensor = _module_reference_tensor(module)
         if tensor is not None and tensor.device.type != "cpu":
-            module.to("cpu", non_blocking=True)
+            cached = self._host_params.get(use.component_name)
+            if cached is not None:
+                for param, host in cached:
+                    param.data = host
+            # Buffers are small and may be mutated on device, so copy them
+            # back; params without a host cache also take this path.
+            # Synchronous D2H: non_blocking offload of a ~60 GB module fails
+            # with hipErrorOutOfMemory on HCU when device memory is near full.
+            module.to("cpu", non_blocking=False)
         self._ready_events.pop(use.component_name, None)
 
     def finish_request(
