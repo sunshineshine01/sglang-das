@@ -87,12 +87,23 @@ class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
         self.parallel_encode_tiling = os.environ.get(
             "SGLANG_MINIMAX_H3_VAE_PARALLEL_ENCODE", "0"
         ).strip().lower() in ("1", "true", "yes", "on")
+        # Run the CNN encoder under BF16 autocast (weights stay fp32; GroupNorm
+        # and the posterior stay fp32). ``use_`` prefix keys the VAE cache.
+        self.use_bf16_encode = os.environ.get(
+            "SGLANG_MINIMAX_H3_VAE_ENCODE_BF16", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
         self.use_parallel_decode = config.use_parallel_decode
         self.parallel_decode_mode = parallel_decode_mode
         # The tiled decode batches under this gate; the CUDA installer registers
         # it for use_vae_fast_path and adds its attention fusion, so other
         # platforms keep the one-tile-per-forward decode.
         self._sgl_gate = VaeFastPathGate()
+
+    def encode(self, x):
+        if self.use_bf16_encode and x.is_cuda:
+            with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16):
+                return super().encode(x).float()
+        return super().encode(x)
 
     def prepare_decoder_autocast_weights(self, dtype) -> int:
         return self.decoder.prepare_autocast_linear_weights(dtype)
