@@ -401,7 +401,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         )
 
     def tiled_encode(self, x):
-        if self.parallel_tiling:  # Fast online encoding for large videos
+        if self.parallel_tiling or getattr(self, "parallel_encode_tiling", False):
             tile_rank, tile_world_size = get_tile_parallel_state()
         else:
             tile_rank, tile_world_size = 0, 1

@@ -93,7 +93,10 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
 
             output_keys = self._visual_output_keys(plan, routed)
             replica_world, replica_rank = minimax_h3_replica_ctx()
-            parallel_encode = replica_world > 1 and bool(self.video_vae.parallel_tiling)
+            parallel_encode = replica_world > 1 and (
+                bool(self.video_vae.parallel_tiling)
+                or bool(getattr(self.video_vae, "parallel_encode_tiling", False))
+            )
             owner_exception = None
             owner_error = None
             if (parallel_encode or replica_rank == 0) and any(
@@ -291,7 +294,8 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
         prepared = minimax_h3_prepared_reference_videos(
             batch,
             plan,
-            share_across_replicas=bool(self.video_vae.parallel_tiling),
+            share_across_replicas=bool(self.video_vae.parallel_tiling)
+            or bool(getattr(self.video_vae, "parallel_encode_tiling", False)),
         )
         videos = prepared.get("videos")
         if not isinstance(videos, list) or not videos:

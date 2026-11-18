@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+
 import torch
 
 from sglang.multimodal_gen.configs.models.vaes.minimax_h3_audio import (
@@ -80,6 +82,11 @@ class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
             chunk_dim=int(arch.vae_chunk_dim),
         )
         self.sglang_config = config
+        # Encode-only complete-tile parallelism (round-robin tiles over the
+        # decode-parallel group, then all-gather); decode scheduling unchanged.
+        self.parallel_encode_tiling = os.environ.get(
+            "SGLANG_MINIMAX_H3_VAE_PARALLEL_ENCODE", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
         self.use_parallel_decode = config.use_parallel_decode
         self.parallel_decode_mode = parallel_decode_mode
         # The tiled decode batches under this gate; the CUDA installer registers

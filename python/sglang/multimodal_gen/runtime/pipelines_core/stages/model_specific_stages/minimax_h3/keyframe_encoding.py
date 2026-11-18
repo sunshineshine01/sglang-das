@@ -160,7 +160,15 @@ def minimax_h3_encode_keyframe_cond_rows(
         ),
         # Parallel tiling all-gathers inside every replica rank's encode;
         # otherwise only rank 0 encodes and broadcasts the rows.
-        group=get_replica_group() if world > 1 and video_vae.parallel_tiling else None,
+        group=(
+            get_replica_group()
+            if world > 1
+            and (
+                video_vae.parallel_tiling
+                or getattr(video_vae, "parallel_encode_tiling", False)
+            )
+            else None
+        ),
     )
 
 
