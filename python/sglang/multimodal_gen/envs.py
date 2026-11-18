@@ -61,6 +61,10 @@ if TYPE_CHECKING:
     # distinct (n_local, n_peer, dtype) staging pairs kept; each is two
     # slots and is never freed, so multi-resolution serving needs a cap
     SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS: int = 16
+    # ROCm/HCU only: run the equal-split Ulysses all-to-all as grouped
+    # per-peer send/recv (dist.all_to_all) instead of all_to_all_single,
+    # which is ~1.7-1.9x faster there with identical results.
+    SGLANG_DIFFUSION_USP_A2A_GROUPED: bool = False
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
     SGLANG_CACHE_DIT_BN: int = 0
@@ -342,6 +346,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS": _lazy_int(
         "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS", 16
     ),
+    "SGLANG_DIFFUSION_USP_A2A_GROUPED": _lazy_bool("SGLANG_DIFFUSION_USP_A2A_GROUPED"),
     "SGLANG_CACHE_DIT_ENABLED": _lazy_bool("SGLANG_CACHE_DIT_ENABLED"),
     # Number of first blocks to always compute (DBCache F parameter)
     "SGLANG_CACHE_DIT_FN": _lazy_int("SGLANG_CACHE_DIT_FN", 1),

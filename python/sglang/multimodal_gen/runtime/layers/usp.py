@@ -14,6 +14,7 @@
 
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+import functools
 import logging
 import math
 from typing import TYPE_CHECKING
@@ -24,6 +25,7 @@ import torch.distributed._functional_collectives as ft_c
 from torch.distributed.tensor.experimental._attention import _cp_options
 
 from sglang.kernels.ops.diffusion import pack_qkv_destination_major, usp_merge_heads
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_sp_group,
@@ -130,8 +132,23 @@ def _usp_all_to_all_single(
         output = _a2a_staging_buffer(role, x.shape, x.dtype, x.device)
     # USP calls this collective many times per denoising step and waits
     # immediately, so avoid the extra wrapper overhead of functional collectives.
-    torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
+    if x.is_cuda and _use_grouped_a2a():
+        world_size = ulysses_pg.size()
+        dist.all_to_all(
+            list(output.view(world_size, -1).unbind(0)),
+            list(x.view(world_size, -1).unbind(0)),
+            group=ulysses_pg,
+        )
+    else:
+        torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
     return output.reshape(x_shape)
+
+
+@functools.cache
+def _use_grouped_a2a() -> bool:
+    # Grouped per-peer send/recv beats all_to_all_single on ROCm/HCU
+    # (~1.7-1.9x for the Ulysses payloads, identical results).
+    return torch.version.hip is not None and envs.SGLANG_DIFFUSION_USP_A2A_GROUPED
 
 
 def _usp_all_to_all_single_varlen(
