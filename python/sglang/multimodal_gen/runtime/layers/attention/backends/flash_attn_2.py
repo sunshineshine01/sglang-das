@@ -89,10 +89,13 @@ class FlashAttention2Impl(AttentionImpl):
         cu_seqlens = cu_seqlens.to(
             device=query.device, dtype=torch.int32
         ).contiguous()
+        # The varlen kernel takes arbitrary row/head strides (the interface only
+        # relayouts when the last dim is not dense), so the strided Q/K/V views
+        # split from the packed Ulysses receive buffer are consumed in place.
         output = flash_attn_varlen_func_interface(
-            query.contiguous(),
-            key.contiguous(),
-            value.contiguous(),
+            query,
+            key,
+            value,
             cu_seqlens,
             cu_seqlens,
             max_seqlen,
