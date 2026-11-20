@@ -693,6 +693,79 @@ class MiniMaxH3TimeEmbedder(nn.Module):
         return out
 
 
+_FP8_E4M3_MAX = 448.0
+_fp8_attention_backend_warned = False
+
+
+def _quantize_varlen_qkv_fp8(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Quantize packed Q/K/V to fp8 (e4m3) for the varlen flash-attention kernel.
+
+    The flash_attn_varlen_func kernel computes attention in fp8 when Q/K/V
+    arrive as e4m3, applying the fp32 descale factors of shape
+    (batch_size, num_heads) inside the kernel; the output stays bf16. The
+    fused headwise Triton path (per-head dynamic scale, two kernels) is used
+    whenever the layout allows, with the Torch per-tensor path as fallback.
+    Everything stays on-device (no host sync), so this is safe to run inside
+    the eager attention break point of the breakable CUDA graph.
+    """
+    batch_size = cu_seqlens.shape[0] - 1
+    from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_quant import (
+        headwise_quantize_fp8,
+    )
+
+    tensors = []
+    for t in (q, k, v):
+        t_fp8, descale = headwise_quantize_fp8(t, batch_size)
+        if t_fp8 is None:
+            return _quantize_varlen_qkv_fp8_torch(q, k, v, cu_seqlens)
+        tensors.append((t_fp8, descale))
+    q_fp8, q_descale = tensors[0]
+    k_fp8, k_descale = tensors[1]
+    v_fp8, v_descale = tensors[2]
+    return q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale
+
+
+def _quantize_varlen_qkv_fp8_torch(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Per-tensor fp8 quantization fallback (abs/amax/mul/cast Torch chain)."""
+    batch_size = cu_seqlens.shape[0] - 1
+    num_heads = q.shape[1]
+
+    def _quantize(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        scale = t.abs().amax().to(torch.float32).clamp_(min=1e-6) / _FP8_E4M3_MAX
+        t_fp8 = (t * (1.0 / scale)).to(torch.float8_e4m3fn)
+        descale = scale.reshape(1, 1).expand(batch_size, num_heads).contiguous()
+        return t_fp8, descale
+
+    q_fp8, q_descale = _quantize(q)
+    k_fp8, k_descale = _quantize(k)
+    v_fp8, v_descale = _quantize(v)
+    return q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale
+
+
 def _minimax_h3_attention_core_impl(
     attention: MiniMaxH3Attention,
     q: torch.Tensor,
@@ -747,6 +820,30 @@ def _minimax_h3_attention_core_impl(
             ring_ws=ring_ws,
         )
     else:
+        # Optional fp8 (e4m3) attention: SGLANG_MINIMAX_H3_FP8_ATTENTION=1
+        # quantizes Q/K/V right before the varlen kernel and hands the
+        # per-tensor descale factors to flash_attn_varlen_func. Ring attention
+        # keeps bf16 (LSE partial merging is not exercised in fp8).
+        q_descale = k_descale = v_descale = None
+        global _fp8_attention_backend_warned
+        use_fp8_attention = (
+            envs.SGLANG_MINIMAX_H3_FP8_ATTENTION
+            and attention._attention_backend_enum
+            in (AttentionBackendEnum.FA, AttentionBackendEnum.FA2)
+        )
+        if envs.SGLANG_MINIMAX_H3_FP8_ATTENTION and not use_fp8_attention:
+            if not _fp8_attention_backend_warned:
+                _fp8_attention_backend_warned = True
+                logger.warning(
+                    "SGLANG_MINIMAX_H3_FP8_ATTENTION=1 is set but the resolved "
+                    "attention backend (%s) does not accept fp8 QKV; keeping "
+                    "attention in bf16.",
+                    attention._attention_backend_enum,
+                )
+        if use_fp8_attention:
+            q, k, v, q_descale, k_descale, v_descale = _quantize_varlen_qkv_fp8(
+                q, k, v, cu_seqlens
+            )
         out = attention._attention_impl.forward_varlen(
             q,
             k,
@@ -754,6 +851,9 @@ def _minimax_h3_attention_core_impl(
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             cu_seqlens_host=cu_seqlens_host,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
     if ulysses_active:
         out = _usp_output_all_to_all(

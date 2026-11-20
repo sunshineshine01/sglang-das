@@ -775,6 +775,112 @@ def quant_rows_fp8(x):
     return q, scale
 
 
+@triton.jit
+def _headwise_amax_fp8(
+    X,
+    AMAX,
+    M,
+    stride_xm,
+    stride_xh,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    pid = tl.program_id(0)  # token block
+    h = tl.program_id(1)  # head
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs = rows[:, None] * stride_xm + h * stride_xh + tl.arange(0, D)[None, :]
+    x = tl.load(X + offs, mask=rows[:, None] < M, other=0.0).to(tl.float32)
+    tl.atomic_max(AMAX + h, tl.max(tl.abs(x)))
+
+
+@triton.jit
+def _headwise_quant_fp8(
+    X,
+    Q,
+    AMAX,
+    SCALE,
+    DESCALE,
+    M,
+    B,
+    stride_xm,
+    stride_xh,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    pid = tl.program_id(0)  # token block
+    h = tl.program_id(1)  # head
+    scale = tl.maximum(tl.load(AMAX + h), 1.0e-12) * (1.0 / 448.0)
+    if pid == 0:
+        tl.store(SCALE + h, scale)
+        for b in range(0, B):
+            tl.store(DESCALE + b * H + h, scale)
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs = rows[:, None] * stride_xm + h * stride_xh + tl.arange(0, D)[None, :]
+    x = tl.load(X + offs, mask=rows[:, None] < M, other=0.0).to(tl.float32)
+    qv = x * (1.0 / scale)
+    qv = tl.minimum(tl.maximum(qv, -448.0), 448.0).to(tl.float8e4nv)
+    out_offs = rows[:, None] * (H * D) + h * D + tl.arange(0, D)[None, :]
+    tl.store(Q + out_offs, qv, mask=rows[:, None] < M)
+
+
+def _headwise_quant_block_supported(t):
+    """Fused headwise fp8 quant applies to GPU strided BF16/FP16 [M, H, D]
+    views (arbitrary row/head strides, dense head_dim, power-of-two D, M>0)."""
+    return (
+        t.ndim == 3
+        and t.layout == torch.strided
+        and t.dtype in (torch.bfloat16, torch.float16)
+        and t.is_cuda
+        and t.shape[0] > 0
+        and t.shape[1] > 0
+        and t.stride(2) == 1
+        and t.stride(0) >= 0
+        and t.stride(1) >= 0
+        and triton.next_power_of_2(t.shape[2]) == t.shape[2]
+    )
+
+
+def headwise_quantize_fp8(t, batch_size):
+    """Headwise fp8 (e4m3) quantization for packed varlen attention Q/K/V.
+
+    Each head gets its own dynamic scale (per-head amax / 448) and the result
+    matches the (batch_size, num_heads) fp32 descale layout the flash-attn fp8
+    kernels consume. Two fused kernels (block-wise amax reduction + quantize)
+    replace the abs/amax/mul/cast Torch chain, halving the activation traffic
+    of the quantize step. Returns (None, None) for unsupported layouts so the
+    caller can fall back to the plain Torch path.
+    """
+    if not _headwise_quant_block_supported(t):
+        return None, None
+    m, h, d = t.shape
+    amax = torch.zeros((h,), device=t.device, dtype=torch.float32)
+    scale = torch.empty((h,), device=t.device, dtype=torch.float32)
+    descale = torch.empty((batch_size, h), device=t.device, dtype=torch.float32)
+    q = torch.empty((m, h, d), device=t.device, dtype=torch.float8_e4m3fn)
+    BLOCK_M = 128
+    grid = (triton.cdiv(m, BLOCK_M), h)
+    _headwise_amax_fp8[grid](
+        t, amax, m, t.stride(0), t.stride(1), D=d, BLOCK_M=BLOCK_M, num_warps=8
+    )
+    _headwise_quant_fp8[grid](
+        t,
+        q,
+        amax,
+        scale,
+        descale,
+        m,
+        batch_size,
+        t.stride(0),
+        t.stride(1),
+        H=h,
+        D=d,
+        BLOCK_M=BLOCK_M,
+        num_warps=8,
+    )
+    return q, descale
+
+
 def linear_fp8(x, weight, scale, bias=None, *, fused=True):
     """Optimized full-row GEMM or the chunked, unfused W8A8 reference path."""
     if (

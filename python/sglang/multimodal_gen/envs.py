@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     SGLANG_MINIMAX_H3_INT8_ENABLE: bool = True
     SGLANG_MINIMAX_H3_INT8_FUSION: bool = True
     SGLANG_MINIMAX_H3_FP8_OPTIMIZE: bool = True
+    SGLANG_MINIMAX_H3_FP8_ATTENTION: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS: str | None = None
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
@@ -177,6 +178,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "SGLANG_MINIMAX_H3_FP8_OPTIMIZE": _lazy_bool(
         "SGLANG_MINIMAX_H3_FP8_OPTIMIZE", "true"
+    ),
+    # Run the MiniMax-H3 DiT flash_attn_varlen_func attention computation in
+    # fp8 (e4m3): Q/K/V are quantized with per-tensor dynamic scales right
+    # before the varlen kernel and the descale factors are applied inside it.
+    # Requires an fp8-capable flash-attn varlen kernel (HCU flash-attn 2.8.4+
+    # or FA3 with descale support). Off by default.
+    "SGLANG_MINIMAX_H3_FP8_ATTENTION": _lazy_bool(
+        "SGLANG_MINIMAX_H3_FP8_ATTENTION", "false"
     ),
     # Directory of the fused per-denoise-step output heads for a MiniMax-H3
     # PDD-distilled checkpoint (see fuse_minimax_h3_pdd_heads.py). An ordinary
