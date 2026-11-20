@@ -84,6 +84,9 @@ class FlashAttention2Impl(AttentionImpl):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
+        q_descale: torch.Tensor | None = None,
+        k_descale: torch.Tensor | None = None,
+        v_descale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del cu_seqlens_host
         cu_seqlens = cu_seqlens.to(
@@ -92,6 +95,17 @@ class FlashAttention2Impl(AttentionImpl):
         # The varlen kernel takes arbitrary row/head strides (the interface only
         # relayouts when the last dim is not dense), so the strided Q/K/V views
         # split from the packed Ulysses receive buffer are consumed in place.
+        # Descale factors are only forwarded for fp8 inputs; flash-attn builds
+        # without fp8 support do not accept these kwargs.
+        descale_kwargs = (
+            {}
+            if q_descale is None and k_descale is None and v_descale is None
+            else {
+                "q_descale": q_descale,
+                "k_descale": k_descale,
+                "v_descale": v_descale,
+            }
+        )
         output = flash_attn_varlen_func_interface(
             query,
             key,
@@ -103,5 +117,6 @@ class FlashAttention2Impl(AttentionImpl):
             dropout_p=self.dropout_p,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
+            **descale_kwargs,
         )
         return output[0] if isinstance(output, tuple) else output

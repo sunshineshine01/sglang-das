@@ -220,6 +220,17 @@ def flash_attn_varlen_func(
         if cu_seqlens_q is not None:
             from flash_attn import flash_attn_varlen_func as fa2_flash_attn_varlen_func
 
+            # Only pass the descale factors when fp8 inputs actually use them;
+            # older flash_attn varlen builds do not accept these kwargs.
+            descale_kwargs = (
+                {}
+                if q_descale is None and k_descale is None and v_descale is None
+                else {
+                    "q_descale": q_descale,
+                    "k_descale": k_descale,
+                    "v_descale": v_descale,
+                }
+            )
             return fa2_flash_attn_varlen_func(
                 q,
                 k,
@@ -233,6 +244,7 @@ def flash_attn_varlen_func(
                 window_size=window_size,
                 softcap=softcap,
                 return_attn_probs=return_softmax_lse,
+                **descale_kwargs,
             )
         else:
             # 4D inputs (batch, seqlen, nheads, headdim) without cu_seqlens
