@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.server_args import server_args as args_module
 from sglang.multimodal_gen.test.unit.test_minimax_h3_image_pipeline_config import (
     write_model_dir,
 )
+from sglang.srt.utils import is_hcu
 
 
 class SimulatedCUDA(Platform):
@@ -243,6 +244,15 @@ def test_rocm_requests_aiter_as_the_dense_attention(make_server):
 def test_dense_attention_backend_is_platform_specific(
     make_server, platform_cls, rejected
 ):
+    if platform_cls is SimulatedROCm and rejected == "fa" and is_hcu():
+        # On a real HCU host the DTK flash_attn build also serves the FA family
+        # through the ROCm selector, so `fa` is admitted (and injected for the
+        # transformer) instead of rejected there.
+        server = make_server(
+            140, platform_cls=platform_cls, attention_backend=rejected
+        )
+        assert server.component_attention_backends["transformer"] == "fa"
+        return
     with pytest.raises(ValueError, match="requires dense FlashAttention"):
         make_server(140, platform_cls=platform_cls, attention_backend=rejected)
 
