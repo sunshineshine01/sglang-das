@@ -3240,6 +3240,475 @@ class LayerwiseOffloadableModuleMixin:
                 manager.release_all()
                 manager.register_forward_hooks()
 
+def is_offload_placeholder(tensor: torch.Tensor) -> bool:
+    return getattr(tensor, "numel", lambda: 0)() <= 1
+
+
+def offload_param_name_aliases(name: str) -> tuple[str, ...]:
+    """``name`` and its ``*.base_layer.*`` counterpart."""
+    names = [name]
+    if ".base_layer." in name:
+        names.append(name.replace(".base_layer.", "."))
+    else:
+        head, sep, leaf = name.rpartition(".")
+        if sep:
+            names.append(f"{head}.base_layer.{leaf}")
+    return tuple(dict.fromkeys(names))
+
+
+def refresh_layerwise_targets(module: torch.nn.Module) -> None:
+    """Repoint every manager at live Parameters after LoRA wrap."""
+    if not is_layerwise_offloaded_module(module):
+        return
+    for manager in module.layerwise_offload_managers:
+        manager.refresh_named_targets()
+
+
+def _refresh_packed_from_manager(layer: torch.nn.Module) -> None:
+    """Re-bind ``_packed_weight_cpu`` after the manager store is replaced."""
+    root = getattr(layer, "_offload_root", None)
+    prefix = getattr(layer, "_offload_param_prefix", None)
+    if root is None or prefix is None:
+        return
+    name = f"{prefix}.weight"
+    for manager in getattr(root, "layerwise_offload_managers", None) or []:
+        getter = getattr(manager, "get_cpu_weight", None)
+        if not callable(getter):
+            continue
+        tensor = getter(name)
+        if tensor is not None:
+            layer._packed_weight_cpu = tensor.detach()
+            return
+
+
+def _release_stale_gpu_layer(layer: torch.nn.Module) -> None:
+    """Release a stale GPU copy so the next prefetch reloads from CPU."""
+    root = getattr(layer, "_offload_root", None)
+    prefix = getattr(layer, "_offload_param_prefix", None)
+    if root is None or prefix is None:
+        return
+    name = f"{prefix}.weight"
+    for manager in getattr(root, "layerwise_offload_managers", None) or []:
+        match = getattr(manager, "_match_layer_idx", None)
+        if not callable(match):
+            continue
+        layer_idx = match(name)
+        if layer_idx is None:
+            continue
+        gpu_layers = getattr(manager, "_gpu_layers", None)
+        if gpu_layers and layer_idx in gpu_layers:
+            manager.release_layer(layer_idx, force=True)
+
+
+def copy_into_packed_view(dest: torch.Tensor | None, src: torch.Tensor) -> bool:
+    """Copy ``src`` into an offload CPU view. Refuse dtype/shape casts."""
+    if dest is None or is_offload_placeholder(dest):
+        return False
+    src = src.detach()
+    if dest.shape != src.shape or dest.dtype != src.dtype:
+        return False
+    dest.copy_(src)
+    return True
+
+
+def write_offload_params(
+    layer: torch.nn.Module, tensors: dict[str, torch.Tensor]
+) -> bool:
+    """Write weights into layerwise CPU buffers, not GPU placeholders."""
+    root = getattr(layer, "_offload_root", None)
+    prefix = getattr(layer, "_offload_param_prefix", None)
+    if root is None or prefix is None:
+        return False
+    managers = getattr(root, "layerwise_offload_managers", None)
+    if not managers:
+        return False
+    named = {f"{prefix}.{key}": value for key, value in tensors.items()}
+    owned: dict[str, object] = {}
+    for manager in managers:
+        if not getattr(manager, "enabled", False):
+            continue
+        for name in named:
+            if name in owned:
+                continue
+            has = getattr(manager, "has_cpu_weight", None)
+            if callable(has) and has(name):
+                owned[name] = manager
+    if not owned:
+        return False
+    missing: list[str] = []
+    for name, value in named.items():
+        manager = owned.get(name)
+        if manager is None:
+            continue
+        updated = manager.update_cpu_weights({name: value}) or set()
+        if name not in updated:
+            missing.append(name)
+    if missing:
+        raise RuntimeError(
+            f"layerwise LoRA writeback missed {missing} (prefix={prefix})"
+        )
+    _refresh_packed_from_manager(layer)
+    return True
+
+
+def finish_offload_writeback() -> None:
+    """No-op; writeback is already synchronous."""
+    return
+
+
+def write_dense_weight(layer: torch.nn.Module, weight: torch.Tensor) -> None:
+    """Write into the manager/view store. Do not replace the Parameter object."""
+    dest = layer.weight
+    if hasattr(dest, "to_local"):
+        dest = dest.to_local()
+    if write_offload_params(layer, {"weight": weight}):
+        _release_stale_gpu_layer(layer)
+        return
+    packed_view = getattr(layer, "_packed_weight_cpu", None)
+    if copy_into_packed_view(packed_view, weight):
+        _release_stale_gpu_layer(layer)
+        return
+    if is_offload_placeholder(dest):
+        raise RuntimeError(
+            "layerwise LoRA writeback has no manager CPU view for a (1,) "
+            "placeholder; convert_to_lora_layers must bind the offload root "
+            "and _packed_weight_cpu first."
+        )
+    packed = weight.detach().to(device=dest.device, dtype=dest.dtype)
+    if dest.data.is_inference() or dest.dtype != packed.dtype:
+        dest.data = packed
+    else:
+        dest.data.copy_(packed)
+
+
+def iter_materialized_weights(module: torch.nn.Module):
+    """Yield (name, tensor) pairs with materialized weights, even under offload.
+
+    When layerwise offload is active, module.named_parameters() returns
+    (1,) placeholders for offloaded layers.  This function reads the
+    actual data from the offload manager's CPU buffers and chains it with
+    the non-offloaded parameters.
+    """
+    offload_managers: list = []
+    if is_layerwise_offloaded_module(module):
+        offload_managers = [m for m in module.layerwise_offload_managers if m.enabled]
+
+    if not offload_managers:
+        yield from module.named_parameters()
+        return
+
+    # Collect offloaded names and their real tensors from CPU buffers.
+    offloaded_names: set[str] = set()
+    for manager in offload_managers:
+        for name, tensor in manager.iter_cpu_weights():
+            offloaded_names.update(offload_param_name_aliases(name))
+            yield name, tensor
+
+    # Skip LoRA-wrapped aliases; those live tensors are often (1,) placeholders.
+    for name, param in module.named_parameters():
+        if name in offloaded_names:
+            continue
+        if is_offload_placeholder(param):
+            continue
+        yield name, param
+
+
+def is_layerwise_offloaded_module(module: torch.nn.Module) -> bool:
+    return isinstance(module, LayerwiseOffloadableModuleMixin) and any(
+        manager.enabled for manager in module.layerwise_offload_managers
+    )
+
+
+def is_resident_layerwise_module(module: torch.nn.Module) -> bool:
+    """True if the module keeps a resident DiT layer set beyond the streaming
+    prefetch window.
+    """
+    return isinstance(module, LayerwiseOffloadableModuleMixin) and any(
+        manager.holds_residents for manager in module.layerwise_offload_managers
+    )
+
+
+def get_layerwise_offload_component_names_for_pipeline(
+    modules: Mapping[str, object],
+    component_names: Sequence[str] | None = None,
+) -> list[str]:
+    """Resolve layerwise selectors against the current pipeline modules.
+
+    Explicit unsupported component names are kept so callers can report them.
+    """
+    normalized_component_names = normalize_layerwise_offload_components(component_names)
+    selected_component_names = (
+        set(normalized_component_names)
+        if normalized_component_names is not None
+        else None
+    )
+
+    if selected_component_names is None:
+        return [
+            component_name
+            for component_name, module in modules.items()
+            if isinstance(module, LayerwiseOffloadableModuleMixin)
+            and module.layerwise_offload_dit_group_enabled
+        ]
+
+    if LAYERWISE_OFFLOAD_ALL_COMPONENTS in selected_component_names:
+        return [
+            component_name
+            for component_name, module in modules.items()
+            if isinstance(module, torch.nn.Module)
+        ]
+
+    explicit_component_names = selected_component_names - {LAYERWISE_OFFLOAD_DIT_GROUP}
+    select_dit_group = LAYERWISE_OFFLOAD_DIT_GROUP in selected_component_names
+    selected_pipeline_component_names: list[str] = []
+    for component_name, module in modules.items():
+        if layerwise_component_matches_any_selection(
+            component_name, explicit_component_names
+        ):
+            selected_pipeline_component_names.append(component_name)
+            continue
+        if select_dit_group and (
+            is_dit_component_name(component_name)
+            or (
+                isinstance(module, LayerwiseOffloadableModuleMixin)
+                and module.layerwise_offload_dit_group_enabled
+            )
+        ):
+            selected_pipeline_component_names.append(component_name)
+    return selected_pipeline_component_names
+
+
+def configure_layerwise_offload_modules(
+    modules: Mapping[str, object],
+    server_args: ServerArgs,
+    component_names: Sequence[str] | None = None,
+    warn_missing: bool = True,
+    *,
+    pin_budget: HostPinBudget | None = None,
+) -> list[str]:
+    """Configure layerwise offload for the given modules, from the given component_names
+
+    Args:
+        modules: the dict of {component_name: component}, containing the components to be chosen from
+        component_names: list of component names. component with names not in this list shouldn't be configured
+
+    Returns a list of component names of modules configured to be layerwise-offload
+    """
+
+    # components which has already been configured to be layerwise-offload
+    configured_component_names: list[str] = []
+    configured_module_ids: set[int] = set()
+    normalized_component_names = normalize_layerwise_offload_components(component_names)
+    selected_component_names = (
+        set(normalized_component_names)
+        if normalized_component_names is not None
+        else None
+    )
+    select_all = (
+        selected_component_names is not None
+        and LAYERWISE_OFFLOAD_ALL_COMPONENTS in selected_component_names
+    )
+    exact_layerwise_selectors = {
+        selector
+        for selector, mode in (server_args.component_residency or {}).items()
+        if mode == LAYERWISE_OFFLOAD and selector not in COMPONENT_RESIDENCY_GROUPS
+    }
+    if server_args.component_residency is not None:
+        selected_pipeline_component_names = [
+            component_name
+            for component_name, module in modules.items()
+            if server_args.residency_mode(component_name) == LAYERWISE_OFFLOAD
+            and (
+                isinstance(module, torch.nn.Module)
+                or component_name in exact_layerwise_selectors
+            )
+        ]
+    else:
+        selected_pipeline_component_names = (
+            get_layerwise_offload_component_names_for_pipeline(
+                modules,
+                normalized_component_names,
+            )
+        )
+
+    if (
+        warn_missing
+        and server_args.component_residency is not None
+        and server_args.disagg_role == RoleType.MONOLITHIC
+    ):
+        missing_component_names = sorted(exact_layerwise_selectors - modules.keys())
+        if missing_component_names:
+            logger.warning(
+                "Layerwise offload components are not currently loaded: %s. "
+                "Available pipeline components: %s",
+                missing_component_names,
+                sorted(modules),
+            )
+
+    if warn_missing and selected_component_names is not None and not select_all:
+        explicit_component_names = selected_component_names - {
+            LAYERWISE_OFFLOAD_DIT_GROUP
+        }
+        missing_component_names = [
+            selected_component_name
+            for selected_component_name in explicit_component_names
+            if not any(
+                layerwise_component_matches_any_selection(
+                    component_name, [selected_component_name]
+                )
+                for component_name in modules
+            )
+        ]
+        if missing_component_names:
+            logger.warning(
+                "Layerwise offload components are not currently loaded: %s. "
+                "Available pipeline components: %s",
+                sorted(missing_component_names),
+                sorted(modules),
+            )
+
+    unsupported_component_names = [
+        component_name
+        for component_name in selected_pipeline_component_names
+        if not isinstance(modules[component_name], LayerwiseOffloadableModuleMixin)
+    ]
+    explicit_unsupported_component_names = [
+        component_name
+        for component_name in unsupported_component_names
+        if (warn_missing and server_args.component_residency is None)
+        or server_args.is_explicit_layerwise_offload_component(component_name)
+    ]
+    if explicit_unsupported_component_names:
+        raise ComponentResidencyError(
+            "Components selected for layerwise-offload do not support it: "
+            f"{sorted(explicit_unsupported_component_names)}"
+        )
+    if unsupported_component_names:
+        for component_name in unsupported_component_names:
+            server_args.record_component_layerwise_capability(
+                component_name, supported=False
+            )
+        selected_pipeline_component_names = [
+            component_name
+            for component_name in selected_pipeline_component_names
+            if component_name not in unsupported_component_names
+        ]
+        logger.warning(
+            "Auto layerwise selection skipped unsupported components; their "
+            "existing placement remains active: %s",
+            sorted(unsupported_component_names),
+        )
+
+    def _default_num_inference_steps() -> int:
+        from sglang.multimodal_gen.registry import (
+            get_model_info,
+            get_pipeline_config_classes,
+        )
+
+        sampling_cls = None
+        pipeline_class_name = server_args.pipeline_class_name
+        if pipeline_class_name:
+            config_classes = get_pipeline_config_classes(pipeline_class_name)
+            if config_classes is not None:
+                sampling_cls = config_classes[1]
+        else:
+            # The override is normally unset. Resolve the pipeline the way
+            # build_pipeline does -- a cache hit by now -- because falling
+            # back to 1 here turns the benefit ranking into a bare-bytes
+            # ranking, and a once-per-request encoder can then outrank the
+            # stepped DiT for the pin budget.
+            model_path = getattr(server_args, "model_path", None)
+            if model_path:
+                model_info = get_model_info(
+                    model_path,
+                    backend=getattr(server_args, "backend", None),
+                    model_id=getattr(server_args, "model_id", None),
+                )
+                if model_info is not None:
+                    sampling_cls = model_info.sampling_param_cls
+        if sampling_cls is None:
+            return 1
+        steps = getattr(sampling_cls(), "num_inference_steps", None)
+        if not steps:
+            return 1
+        return max(1, int(steps))
+
+    default_steps = _default_num_inference_steps()
+
+    def _h2d_bytes_a_pin_would_save(name: str) -> int:
+        """What pinning this component is worth, in bytes moved per request.
+
+        A DiT under layerwise offload re-streams its layers on every denoise
+        step; everything else transfers once. Ranking on the product rather
+        than on "is it the DiT" matters for few-step models, where a large
+        one-shot text encoder can move more bytes per request than a small DiT
+        stepped four times.
+        """
+        module = modules[name]
+        if not isinstance(module, LayerwiseOffloadableModuleMixin):
+            return 0
+        return pin_benefit_bytes(
+            weight_bytes=module_weight_bytes(module),
+            uses_per_request=(
+                default_steps if module.layerwise_offload_dit_group_enabled else 1
+            ),
+        )
+
+    # Offer the budget in descending order of what a pin saves, so the bytes
+    # that would move most often claim it first. sorted() is stable, so equal
+    # rankings keep their original order.
+    selected_pipeline_component_names = sorted(
+        selected_pipeline_component_names,
+        key=_h2d_bytes_a_pin_would_save,
+        reverse=True,
+    )
+    if pin_budget is None:
+        pin_budget = HostPinBudget()
+    logger.info("Layerwise offload host memory: %s", describe_host_memory())
+
+    for component_name in selected_pipeline_component_names:
+        module = modules[component_name]
+        if not isinstance(module, LayerwiseOffloadableModuleMixin):
+            continue
+        server_args.record_component_layerwise_capability(
+            component_name, supported=True
+        )
+        module_id = id(module)
+        if module_id in configured_module_ids:
+            # avoid duplicated configures on a same module
+            continue
+
+        configured_module_ids.add(module_id)
+
+        if not is_layerwise_offloaded_module(module):
+            module.configure_layerwise_offload(
+                server_args, pin_budget=pin_budget, component_name=component_name
+            )
+        if not is_layerwise_offloaded_module(module):
+            raise ComponentResidencyError(
+                f"Component {component_name!r} did not enable layerwise offload"
+            )
+        configured_component_names.append(component_name)
+
+    if configured_component_names:
+        # Report where the weights ended up, not just which components opted
+        # in. The loader's per-component line runs before this, so it can only
+        # ever describe the pre-offload placement.
+        from sglang.multimodal_gen.runtime.loader.utils import (
+            format_component_residency,
+        )
+
+        logger.info(
+            "Layerwise offload summary: %s",
+            ", ".join(
+                f"{name} ({format_component_residency(modules[name])})"
+                for name in configured_component_names
+            ),
+        )
+    elif warn_missing:
+        logger.debug("No selected pipeline component enabled layerwise offload")
+    return configured_component_names
+
 
 @contextmanager
 def capture_layerwise_offload(model: torch.nn.Module, stream):
