@@ -46,7 +46,18 @@ class MiniMaxH3ImageSamplingParams(SamplingParams):
 
     @classmethod
     def image_request_extra_fields(cls) -> frozenset[str]:
-        return frozenset({"min_generation_area"})
+        # profile_start_step is a base-SamplingParams request-scoped switch;
+        # declaring it lets /v1/images/generations forward it so the diffusion
+        # SGLDiffusionProfiler can start mid-schedule per HTTP request. The
+        # other profiling switches (profile, num_profiled_timesteps,
+        # profile_all_stages) are v0.5.22 protocol fields the endpoint already
+        # forwards explicitly, so they must not be re-declared here.
+        return frozenset(
+            {
+                "min_generation_area",
+                "profile_start_step",
+            }
+        )
 
     @classmethod
     def default_image_output_format(cls) -> str:
