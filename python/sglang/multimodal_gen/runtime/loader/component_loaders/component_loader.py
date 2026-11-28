@@ -753,6 +753,7 @@ class WeightOverrideComponentLoader(ComponentLoader):
         *,
         component_starts_on_cpu: bool,
         weight_load_plan: WeightLoadPlan | None = None,
+        streaming_state_dict_load: bool = False,
         checkpoint_key_filter: Callable[[str], bool] | None = None,
         weights_iterator: Iterator[tuple[str, torch.Tensor]] | None = None,
     ) -> nn.Module:
@@ -771,6 +772,7 @@ class WeightOverrideComponentLoader(ComponentLoader):
             reduce_dtype=torch.float32,
             strict=self.strict_checkpoint_keys,
             weight_load_plan=weight_load_plan,
+            streaming_state_dict_load=streaming_state_dict_load,
             checkpoint_key_filter=checkpoint_key_filter,
             weights_iterator=weights_iterator,
         )
